@@ -3443,6 +3443,9 @@ char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
   v4 = 0;
   v9[0] = 1;
   v9[1] = 2;
+  // Special command array for the last firmware packet:
+  // v10[0] = -127 (0x81) = 0x01 | 0x80 (FW1 Last Chunk)
+  // v10[1] = -126 (0x82) = 0x02 | 0x80 (FW2 Last Chunk)
   v10[0] = -127;
   v10[1] = -126;
   while ( 1 )
