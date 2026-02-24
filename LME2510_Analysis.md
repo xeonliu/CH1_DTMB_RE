@@ -16,31 +16,50 @@ The device communicates primarily via USB Bulk transfers.
 
 ### Command Structure
 Commands are sent to Pipe 1. Common packet structure:
-`[CmdID] [Length] [SubCmd/Param] [Data...]`
+`[CmdID] [Length] [SubCmd/Param] [Data...] [Checksum]`
 
 #### Common Commands
 - **0x01 / 0x02**: Firmware Download (Chunked).
 - **0x04**: Register Write / I2C Write.
   - Format: `[04] [Len] [SubCmd] [Data...]`
-- **0x84**: Register Read / I2C Read.
+- **0x84**: Register Read / I2C Read (Generic).
   - Format: `[84] [03] [SubCmd] [Param] [ReadLen]`
+- **0x85**: Demodulator Register Read.
+  - Format: `[85] [02] [DevAddr] [RegAddr] [00]`
 
 ## 3. Firmware Download Flow
 The driver checks if the firmware is loaded (Cold Boot). If not, it performs a 2-stage download process.
 
 **Function**: `sub_1392E` (Firmware Download Loop)
 - **Chunk Size**: 50 bytes per packet.
+- **Checksum**: Simple 8-bit summation of the payload (`sub_135CA`).
+- **Packet Structure**:
+  `[Cmd] [Len-1] [Data (50 bytes)] [Checksum]`
+- **Command IDs**:
+  - **Firmware 1**: `0x01` (Normal), `0x81` (Last Chunk, `0x01 | 0x80`).
+  - **Firmware 2**: `0x02` (Normal), `0x82` (Last Chunk, `0x02 | 0x80`).
 - **Process**:
   1. Driver reads firmware blob from internal resource.
   2. Splits data into 50-byte chunks.
   3. Sends each chunk to Pipe 1.
-  4. Waits for acknowledgment.
+  4. Waits for acknowledgment (Status `0x88` typically).
 
 **Stages** (`sub_13A95`):
 1. **Firmware 1**: Likely the USB controller patch or bootloader.
 2. **Firmware 2**: Tuner/Demodulator initialization script.
 
-## 4. Tuner & Demodulator Control
+## 4. Demodulator Identification
+The driver identifies the specific Demodulator chip model to apply the correct initialization sequence.
+
+**Function**: `sub_13AD7` (Demodulator Identification)
+- **Logic**:
+  1. Read Register `0x00` of Device `0x32` (Demodulator).
+  2. **Check Value**:
+     - If `0x0E` (14) -> **LGS8GL5**.
+     - Otherwise -> **LGS8G75**.
+- **Command Used**: `0x85` (via `sub_1485E` -> `sub_14240`).
+
+## 5. Tuner & Demodulator Control
 The driver controls the Tuner and Demodulator via I2C, bridged through the LME2510C.
 
 **Function**: `sub_13C03` (Tuner Apply Frequency)
@@ -52,7 +71,7 @@ The driver controls the Tuner and Demodulator via I2C, bridged through the LME25
   - Frequency is converted from KHz to MHz.
   - Sent to MAX2165 via I2C.
 
-## 5. Stream Handling
+## 6. Stream Handling
 MPEG-TS data is received via Bulk IN transfers on Pipe 2.
 
 **Function**: `sub_128DC` (Submit Stream IRP)
