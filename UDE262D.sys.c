@@ -2333,6 +2333,9 @@ NTSTATUS __thiscall sub_12587(ULONG *this, struct _LIST_ENTRY *P, PIRP Irp, stru
 }
 
 //----- (0001274F) --------------------------------------------------------
+// [PROTOCOL] Stream Callback (Completion Routine)
+// Handles incoming MPEG-TS stream data from Pipe 2.
+// Copies data to KSSTREAM_POINTER.
 int __stdcall sub_1274F(int a1, PIRP Irp, int a3)
 {
   _DWORD *v3; // esi
@@ -2383,6 +2386,7 @@ int __stdcall sub_1274F(int a1, PIRP Irp, int a3)
       {
         if ( v9[1] >= 0 )
         {
+          // Copy received data to internal buffer
           memcpy(&v19[v5], Src, *v9);
           v5 += *v9;
         }
@@ -2393,6 +2397,7 @@ int __stdcall sub_1274F(int a1, PIRP Irp, int a3)
       while ( v20 < *(_DWORD *)(v22 + 76) );
       if ( v5 )
       {
+        // Get KS Stream Pointer to push data up the stack
         LeadingEdgeStreamPointer = KsPinGetLeadingEdgeStreamPointer(Pin, KSSTREAM_POINTER_STATE_LOCKED);
         v11 = LeadingEdgeStreamPointer;
         if ( LeadingEdgeStreamPointer )
@@ -2427,6 +2432,7 @@ LABEL_19:
     if ( *(_DWORD *)(v14 + 12) )
     {
       if ( v14 )
+        // Resubmit IRP to keep streaming
         sub_128DC(v14);
     }
   }
@@ -2435,6 +2441,8 @@ LABEL_19:
 // 128DC: using guessed type int __thiscall sub_128DC(_DWORD);
 
 //----- (000128DC) --------------------------------------------------------
+// [PROTOCOL] Start Stream / Submit Stream IRP
+// Submits Bulk IN requests to Pipe 2 (Endpoint 0x82) to read TS data.
 NTSTATUS __thiscall sub_128DC(_DWORD *this)
 {
   int v1; // eax
@@ -2452,7 +2460,8 @@ NTSTATUS __thiscall sub_128DC(_DWORD *this)
   CCHAR StackSizea; // [esp+4h] [ebp-8h]
   CCHAR StackSizeb[4]; // [esp+4h] [ebp-8h]
   PVOID P; // [esp+8h] [ebp-4h]
-
+  
+  // Setup buffers and IRP
   v1 = *(_DWORD *)(this[23] + 4);
   v2 = 20 * this[5];
   v3 = v1 + v2 + 16;
@@ -2514,6 +2523,7 @@ NTSTATUS __thiscall sub_128DC(_DWORD *this)
   if ( Irp->CurrentLocation <= 0 )
     RtlAssert("Irp->CurrentLocation > 0", "c:\\winddk\\7600.16385.0\\inc\\ddk\\wdm.h", 0x5BB9u, 0);
   v12 = Irp->Tail.Overlay.PacketType - 36;
+  // Set Completion Routine to sub_1274F
   *(_DWORD *)(v12 + 28) = sub_1274F;
   *(_DWORD *)(v12 + 32) = *(_DWORD *)StackSizeb;
   *(_BYTE *)(v12 + 3) = -32;
@@ -2728,6 +2738,9 @@ void __thiscall sub_12D52(int *this)
 }
 
 //----- (00012D81) --------------------------------------------------------
+// [PROTOCOL] Stream Callback 2
+// Alternative completion routine for stream data.
+// Handles data copy to KSSTREAM_POINTER.
 int __stdcall sub_12D81(int a1, IRP *OutUsed, _DWORD *P)
 {
   int v3; // esi
@@ -3072,6 +3085,8 @@ int __thiscall sub_132F5(int this, int a2)
 }
 
 //----- (000133A2) --------------------------------------------------------
+// [PROTOCOL] Submit Stream IRP 2
+// Submits IRPs for the alternative stream path.
 NTSTATUS __thiscall sub_133A2(ULONG *this)
 {
   NTSTATUS result; // eax
@@ -3389,6 +3404,10 @@ char __stdcall sub_138A6(int a1, char a2, char a3, size_t MaxCount, void *a5)
 }
 
 //----- (0001392E) --------------------------------------------------------
+// [PROTOCOL] Firmware Download
+// Downloads firmware to the device.
+// a1: Firmware ID (1 or 2)
+// a2: Device Context
 char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
 {
   char v2; // al
@@ -3402,6 +3421,7 @@ char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
   char v11; // [esp+16h] [ebp-2h]
   unsigned __int8 v12; // [esp+17h] [ebp-1h]
 
+  // Select firmware blob based on ID (a1) and device state
   v7 = (char *)&unk_20F38;
   v8 = 512;
   if ( a1 == 2 )
@@ -3430,17 +3450,20 @@ char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
     byte_2DF6A[v3] = v2;
     v6 = v4 + 1;
     v11 = v7[v4 + 1];
+    // Check if end of firmware blob reached
     if ( v4 + 1 >= v8 )
     {
       byte_2DF68 = v10[v12];
       byte_2DF69 = v3++;
       sub_135CA(byte_2DF6A, v3);
+      // Send final chunk
       if ( !sub_11A74(a2, 1, &byte_2DF68, v3 + 3)
         || sub_11AB7(a2, 129, (int)&byte_2DF68, 1) && byte_2DF68 != -120 && byte_2DF68 != 119 )
       {
         break;
       }
     }
+    // Send in chunks of 50 bytes
     if ( ++v3 == 50 )
     {
       if ( v6 >= v8 )
@@ -3449,6 +3472,7 @@ char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
       v3 = 0;
       sub_135CA(byte_2DF6A, 50);
       byte_2DF68 = v9[v12];
+      // Send chunk via Pipe 1
       if ( !sub_11A74(a2, 1, &byte_2DF68, 53)
         || sub_11AB7(a2, 129, (int)&byte_2DF68, 1) && byte_2DF68 != -120 && byte_2DF68 != 119 )
       {
@@ -3468,13 +3492,22 @@ char __userpurge sub_1392E@<al>(int a1@<eax>, int a2)
 // 2DF69: using guessed type char byte_2DF69;
 
 //----- (00013A95) --------------------------------------------------------
+// [PROTOCOL] Firmware Load Entry
+// Initializes device by downloading firmware blobs.
 bool __stdcall sub_13A95(int a1)
 {
   sub_11A5E(a1);
+  // Download two firmware blobs
   return sub_1392E(1, a1) && sub_1392E(2, a1) && sub_13EC8(a1);
 }
 
 //----- (00013AD7) --------------------------------------------------------
+// [PROTOCOL] Demodulator Identification
+// Identifies the Demodulator chip version (LGS8GL5 vs LGS8G75).
+// Logic:
+// 1. Read Register 0x00 of Device 0x32 (Demod).
+// 2. If Value == 0x0E (14) -> LGS8GL5.
+// 3. Else -> LGS8G75.
 char __stdcall sub_13AD7(int a1)
 {
   int v1; // esi
@@ -3491,8 +3524,13 @@ char __stdcall sub_13AD7(int a1)
   if ( (_BYTE)word_21042 == 0xD0 )
     sub_13F3E(v1, 1);
   byte_2DEE1 = 0;
+  
+  // Read Demod Register 0x00
+  // a1+3 (HIBYTE(a1)) will store the result
   if ( sub_1485E(50, 0, (_BYTE *)&a1 + 3) )
     return 0;
+    
+  // Check if Register 0x00 == 14 (0x0E)
   if ( HIBYTE(a1) == 14 )
   {
     byte_2241C = 0;
@@ -4252,12 +4290,19 @@ char __stdcall sub_14830(int a1, char *a2, unsigned __int8 a3)
 // 2DFF4: using guessed type int dword_2DFF4;
 
 //----- (0001485E) --------------------------------------------------------
+// [PROTOCOL] Read I2C Register (Wrapper)
+// Wraps command 0x85 to read a single byte from an I2C device.
+// a1: Device Address (e.g., 0x32 for Demod)
+// a2: Register Address
+// a3: Pointer to store the read value
 char __stdcall sub_1485E(char a1, char a2, _BYTE *a3)
 {
   _BYTE v4[4]; // [esp+4h] [ebp-10h] BYREF
   char v5[8]; // [esp+8h] [ebp-Ch] BYREF
 
   v5[0] = a2;
+  // sub_14240 sends Command 0x85
+  // dword_2DFF4 is likely the Context/Device Object
   if ( !sub_14240(dword_2DFF4, a1, v5, 1, (int)v4) )
     return -3;
   *a3 = v5[0];
