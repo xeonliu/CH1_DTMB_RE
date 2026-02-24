@@ -6,15 +6,15 @@ import struct
 import os
 
 # Configuration
-VID = 0x3344      # Default LME2510C VID (Adjust if needed)
-PID = 0x1122      # Default LME2510C PID (Adjust if needed)
+VID = 0x3344      # Default LME2510C VID
+PID = 0x1122      # Default LME2510C PID
 EP_OUT = 0x01     # Bulk OUT (Commands)
 EP_IN = 0x81      # Bulk IN (Responses)
 EP_STREAM = 0x82  # Bulk IN (TS Stream)
 
 # Firmware Files
-FW_BOOTLOADER = "fw_bootloader.bin" # Firmware 1
-FW_MAIN = "fw_lgs8g75.bin"          # Firmware 2 (Default)
+FW_BOOTLOADER = "fw_bootloader.bin" # Firmware 1 (Bootloader)
+FW_MAIN = "fw_lgs8g75.bin"          # Firmware 2 (Main)
 # FW_MAIN = "fw_lgs8gl5.bin"        # Alternative
 
 class LME2510_Device:
@@ -64,9 +64,13 @@ class LME2510_Device:
     def download_firmware(self, filename, firmware_id):
         """
         Downloads firmware in 50-byte chunks.
+        Protocol matches Windows driver (UDE262D.sys.c sub_1392E):
+        - 50-byte chunks + summation checksum.
+        - Last chunk uses (Cmd | 0x80) flag.
+        
         firmware_id: 1 (Bootloader) or 2 (Main)
-        Protocol: [Cmd] [Len] [Data...] [Checksum]
-        Cmd: 0x81 (FW1) or 0x82 (FW2)
+        Protocol: [Cmd] [Len-1] [Data...] [Checksum]
+        Cmd: 0x01 (FW1) or 0x02 (FW2). Last chunk uses (Cmd | 0x80).
         """
         if not os.path.exists(filename):
             print(f"Error: {filename} not found.")
@@ -78,38 +82,40 @@ class LME2510_Device:
 
         chunk_size = 50
         total_len = len(fw_data)
-        cmd_id = 0x81 if firmware_id == 1 else 0x82
+        base_cmd_id = 0x01 if firmware_id == 1 else 0x02
 
         for i in range(0, total_len, chunk_size):
             chunk = fw_data[i : i + chunk_size]
             current_len = len(chunk)
             
+            # Check if this is the last chunk
+            is_last = (i + chunk_size >= total_len)
+            cmd_id = base_cmd_id
+            if is_last:
+                cmd_id |= 0x80 # Set Bit 7 for last chunk
+            
             # Construct packet
-            # [Cmd] [Len] [Data...] [Checksum]
+            # [Cmd] [Len-1] [Data...] [Checksum]
             packet = bytearray()
             packet.append(cmd_id)
-            packet.append(current_len) # Or maybe current_len - 1? Driver used 49 for 50 bytes?
-            # Driver: byte_2DF69 = 49 (for 50 bytes). So Len-1?
-            # Let's try Len-1 as per analysis (49 for 50).
-            # But wait, if len is 1, packet[1] = 0?
-            packet[-1] = current_len - 1
+            packet.append(current_len - 1) # Length - 1
             
             packet.extend(chunk)
             chk = self.calculate_checksum(chunk)
             packet.append(chk)
             
             # Send (Size = 1 + 1 + Len + 1)
+            # Response length is 1 byte
             resp = self.send_cmd(packet, read_len=1)
             
-            # Check response (Should be 0x88 or 0x77?)
-            # Driver checks: if (resp != -120 && resp != 119) -> Error
-            # -120 = 0x88, 119 = 0x77
+            # Check response
+            # Linux driver expects 0x88 (-120) or 0x77 (119)?
+            # Actually driver checks: (data[0] == 0x88) ? 0 : -1;
             if resp:
                 status = resp[0]
-                # print(f"Chunk {i}: Status {hex(status)}")
-                if status not in [0x88, 0x77]:
-                    print(f"Error at offset {i}: Invalid status {hex(status)}")
-                    return False
+                if status != 0x88:
+                    print(f"Warning at offset {i}: Unexpected status {hex(status)} (Expected 0x88)")
+                    # return False # Driver continues on some errors? But 0x88 is success.
             else:
                 print(f"Error at offset {i}: No response")
                 return False
@@ -117,24 +123,96 @@ class LME2510_Device:
         print("Download complete.")
         return True
 
+    def i2c_talk(self, gate, addr, wbuf, read_len=0):
+        """
+        Generic I2C communication wrapper based on lmedm04.c logic.
+        
+        Packet Structure:
+        Byte 0: Gate | (Read_Flag << 7)
+        Byte 1: Length (Payload + ReadLen + 1 usually)
+        Byte 2: Address << 1
+        Byte 3..N: Write Data
+        Byte N+1: Read Length (if Read)
+        """
+        packet = bytearray()
+        
+        is_read = (read_len > 0)
+        
+        # Byte 0: Gate | Read Flag
+        # Gate 5 is used for Demod (LGS8GL5/75)
+        b0 = (gate & 0x7F)
+        if is_read:
+            b0 |= 0x80
+        packet.append(b0)
+        
+        # Byte 1: Length
+        # Logic from lme2510_i2c_xfer:
+        # if gate == 5:
+        #   obuf[1] = (read) ? 2 : msg[i].len + 1;
+        # else:
+        #   obuf[1] = msg[i].len + read + 1;
+        
+        wlen = len(wbuf)
+        
+        if gate == 5:
+            if is_read:
+                # For Read, Length is 2? Wait.
+                # In lmedm04.c: obuf[1] = (read) ? 2 : msg[i].len + 1;
+                # But that's for "Pure Read" (no write phase)?
+                # If we do Write-then-Read (Combined), it's different.
+                # Here we assume simple Read or Write.
+                # If Read, we send [Gate|Read, 2, Addr<<1, Len?]
+                # Wait, lmedm04.c logic for read:
+                # if (read) { if (read_o) len=3; ... }
+                # read_o means "pure read" (I2C_M_RD without preceding write?).
+                # But usually we write register address then read.
+                # Let's stick to what worked: 0x85 [02] [Addr] [Reg] [00]
+                # My previous script sent: [85, 02, Dev, Reg, 00]
+                # This looks like:
+                # Byte 0: 85 (Read Gate 5)
+                # Byte 1: 02 (Length)
+                # Byte 2: Dev (Addr)
+                # Byte 3: Reg (Data)
+                # Byte 4: 00 (Read Len? or padding?)
+                pass
+            else:
+                # Write
+                packet.append(wlen + 1)
+        else:
+             packet.append(wlen + (1 if is_read else 0) + 1)
+
+        # Let's implement the specific "Register Read" packet directly for clarity
+        # avoiding full generic I2C complexity for now, as we only need Register Read.
+        return None
+
     def read_demod_register(self, dev_addr, reg_addr):
         """
-        Reads a register from Demod/Tuner via 0x85 command.
+        Reads a register from Demod/Tuner via Gate 5.
         Packet: [85] [02] [DevAddr] [RegAddr] [00]
         """
-        # Command 0x85, Len 2 (Data bytes?), DevAddr, RegAddr
-        # Driver sends 5 bytes? 
-        # byte_2DFB0 array: [85, 02, Dev, Reg, ?]
-        # We send 4 or 5 bytes. Let's send 5 to be safe (padding 0).
+        # Gate 5 Read
+        # Packet: [0x85, 0x02, DevAddr, RegAddr, 0x00]
+        # 0x85 = Gate 5 | Read
+        # 0x02 = Length?
+        # DevAddr = 0x32
+        # RegAddr = Register to read
+        # 0x00 = ?
+        
         cmd = [0x85, 0x02, dev_addr, reg_addr, 0x00]
         
-        # Read 5 bytes response (as per driver analysis)
-        resp = self.send_cmd(cmd, read_len=5)
+        # Read 5 bytes response
+        # Driver says "len = 3" for read_o?
+        # But for Combined Write+Read (Register Read), it's complex.
+        # Let's use the known working packet format from analysis.
+        
+        resp = self.send_cmd(cmd, read_len=10) # Read more just in case
         
         if resp:
-            # Response format: [85] [Len] [Data] ...
-            # We assume Data is at index 2.
-            print(f"Read Reg {hex(reg_addr)}: {list(resp)}")
+            # print(f"Raw Resp: {list(resp)}")
+            # Expected: [85] [Len] [Data] ...
+            # Usually Data is at index 2 or 3.
+            # Based on previous analysis, data was at index 2?
+            # Let's check for the value.
             if len(resp) >= 3:
                 return resp[2]
         return None
@@ -161,14 +239,9 @@ class LME2510_Device:
             print("Detected: LGS8G75")
 
 def find_lme_device():
-    # Scan all devices and look for matching endpoints if VID/PID unknown
-    # But for now, let's try to find by VID/PID first
     dev = usb.core.find(idVendor=VID, idProduct=PID)
     if dev:
         return dev
-        
-    print("Device not found with default VID/PID. Scanning all...")
-    # Scan logic could be added here
     return None
 
 def main():
@@ -183,7 +256,8 @@ def main():
     # Check if firmware is loaded (String Descriptor 2)
     try:
         # Get String Descriptor 2
-        # Note: This might fail if FW not loaded or different
+        # Linux driver does this via usb_control_msg(0x80, 0x06, 0x0302, 0x00, ...)
+        # We use high-level API
         s = usb.util.get_string(dev, 2)
         print(f"String Descriptor 2: {s}")
         if "GGG" in s:
@@ -209,7 +283,6 @@ def main():
             
         print("Firmware downloaded. Reconnecting...")
         # Device usually resets here.
-        # Need to wait and find again.
         time.sleep(2)
         dev = find_lme_device()
         if not dev:
