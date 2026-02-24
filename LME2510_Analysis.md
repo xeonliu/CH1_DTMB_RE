@@ -2,9 +2,10 @@
 
 ## 1. Hardware Architecture
 Based on the driver code (`UDE262D.sys`), the device uses the following components:
-- **USB Bridge**: Leaguer MicroElectronics LME2510C
-- **Demodulator**: Legend Silicon LGS8GL5 or LGS8G75 (I2C Address: 0x32)
-- **Tuner**: Maxim MAX2165 (I2C Address: 0xC0)
+- **USB Bridge**: [Leaguer MicroElectronics LME2510C](https://github.com/torvalds/linux/blob/master/drivers/media/usb/dvb-usb-v2/lmedm04.c)
+  - [kernel.org](https://www.kernel.org/doc/html/v5.7/media/dvb-drivers/lmedm04.html#for-lme2510c)
+- **Demodulator**: Legend Silicon [LGS8GL5](https://www.eet-china.com/archives/47069.html) or [LGS8G75](https://www.c114.com.cn/news/16/a359767.html) (I2C Address: 0x32)
+- **Tuner**: [Maxim MAX2165](https://www.analog.com/media/en/technical-documentation/data-sheets/max2165.pdf) (I2C Address: 0xC0)
 
 ## 2. USB Protocol
 The device communicates primarily via USB Bulk transfers.
