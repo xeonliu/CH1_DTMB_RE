@@ -22,6 +22,8 @@ Commands are sent to Pipe 1. Common packet structure:
 - **0x01 / 0x02**: Firmware Download (Chunked).
 - **0x04**: Register Write / I2C Write.
   - Format: `[04] [Len] [SubCmd] [Data...]`
+- **0x05**: Single Register Write.
+  - Format: `[05] [04] [DevAddr] [RegAddr] [Value]`
 - **0x84**: Register Read / I2C Read (Generic).
   - Format: `[84] [03] [SubCmd] [Param] [ReadLen]`
 - **0x85**: Demodulator Register Read.
@@ -63,13 +65,40 @@ The driver identifies the specific Demodulator chip model to apply the correct i
 The driver controls the Tuner and Demodulator via I2C, bridged through the LME2510C.
 
 **Function**: `sub_13C03` (Tuner Apply Frequency)
-- **I2C Repeater Mode**:
-  - To talk to the Tuner (MAX2165), the driver enables "Repeater Mode" on the Demodulator (LGS8GL5).
-  - Enable: Write `0xE0` to Demod Register `0x01`.
-  - Disable: Write `0x60` to Demod Register `0x01`.
-- **Frequency Setting**:
-  - Frequency is converted from KHz to MHz.
-  - Sent to MAX2165 via I2C.
+
+### 5.1 Frequency Calculation (MAX2165)
+Base Reference Frequency (RefFreq) is **12 MHz**.
+
+**Formula**:
+$$ F_{LO} = (N + \frac{K}{2^{20}}) \times F_{REF} $$
+
+*   $F_{LO}$: Target Frequency (MHz)
+*   $F_{REF}$: 12 MHz
+*   $N$: Integer Divider
+*   $K$: Fractional Divider
+
+**Calculation Steps**:
+1.  `N = Floor(Freq / 12)`
+2.  `K = Floor(((Freq % 12) * 2^20) / 12)`
+
+### 5.2 Tuning Sequence
+
+1.  **Enable I2C Repeater**:
+    *   Write `0xE0` to Demodulator (0x32) Register `0x01`.
+    *   Command: `05 04 32 01 E0`
+
+2.  **Send Tuner Configuration**:
+    *   Write 5 bytes to Tuner (0xC0) starting at Register `0x00`.
+    *   Byte 0: `N` (Integer Divider)
+    *   Byte 1: `(K >> 16) & 0x0F` (Fractional High 4 bits)
+    *   Byte 2: `(K >> 8) & 0xFF` (Fractional Mid 8 bits)
+    *   Byte 3: `K & 0xFF` (Fractional Low 8 bits)
+    *   Byte 4: Bandwidth Control (e.g., `0x05` or `0x0F`, depends on Freq > 725MHz)
+    *   Command: `04 06 C0 00 [B0] [B1] [B2] [B3] [B4]`
+
+3.  **Disable I2C Repeater**:
+    *   Write `0x60` to Demodulator (0x32) Register `0x01`.
+    *   Command: `05 04 32 01 60`
 
 ## 6. Stream Handling
 MPEG-TS data is received via Bulk IN transfers on Pipe 2.
@@ -84,3 +113,14 @@ MPEG-TS data is received via Bulk IN transfers on Pipe 2.
 - Copies the received TS data into the Kernel Streaming (KS) buffer (`KSSTREAM_POINTER`).
 - Advances the KS stream pointer to notify the graph (e.g., Media Player).
 - Re-submits the URB to continue streaming.
+
+## 7. Key Function Mapping
+
+| Original Function | Description | Note |
+| :--- | :--- | :--- |
+| `sub_1524A` | `Tuner_SetFrequency` | Core tuning entry point |
+| `sub_150C4` | `Tuner_CalcDividers` | Calculates N and K values |
+| `sub_15114` | `Tuner_CalcControl` | Calculates Bandwidth Control byte |
+| `sub_14083` | `LME_WriteBlock` | Sends 0x04 Command |
+| `sub_14106` | `LME_ReadBlock` | Sends 0x84 Command |
+| `sub_1206C` | `Usb_SubmitUrb` | Low-level URB submission |
