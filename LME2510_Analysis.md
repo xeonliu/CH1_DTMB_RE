@@ -4,6 +4,8 @@
 Based on the driver code (`UDE262D.sys`), the device uses the following components:
 - **USB Bridge**: [Leaguer MicroElectronics LME2510C](https://github.com/torvalds/linux/blob/master/drivers/media/usb/dvb-usb-v2/lmedm04.c)
   - [kernel.org](https://www.kernel.org/doc/html/v5.7/media/dvb-drivers/lmedm04.html#for-lme2510c)
+  - **USB VID/PID**: `0x3344` / `0x1120` (confirmed from device descriptor)
+  - **USB Speed**: High Speed (480 Mbit/s), self-powered, max 500 mA
 - **Demodulator**: Legend Silicon [LGS8GL5](https://www.eet-china.com/archives/47069.html) or [LGS8G75](https://www.c114.com.cn/news/16/a359767.html)
   - **Primary I2C Address**: `0x32` (registers `0x00`–`0xBF`)
   - **Extended I2C Address**: `0x36` (registers `0xC0`–`0xFF`, same chip, high bank routed via `sub_142BB`)
@@ -12,11 +14,26 @@ Based on the driver code (`UDE262D.sys`), the device uses the following componen
 ## 2. USB Protocol
 The device communicates primarily via USB Bulk transfers.
 
+### Interface Alternate Settings
+The device has a single interface with **two alternate settings**:
+- **Alt Setting 0** (0 endpoints): Idle / standby state.
+- **Alt Setting 1** (7 endpoints): Active working state. The driver switches to this via `SET_INTERFACE` before any I2C or stream operations.
+
 ### Endpoints (Pipes)
-- **Pipe 0 (Endpoint 0x81 IN)**: Command responses and status.
-- **Pipe 1 (Endpoint 0x01 OUT)**: Command submission (Firmware download, Register R/W).
-- **Pipe 2 (Endpoint 0x88 IN)**: MPEG-TS Stream data. *(Note: `0x88` = EP8 IN, not EP2. Confirmed by USBlyzer capture `C:I:E = 01:00:88`.)*
-- **Pipe 3 (Endpoint 0x8A IN)**: Asynchronous signal status / demodulator lock status. Returns 8-byte packets at ~500 ms intervals. *(Confirmed by USBlyzer capture `C:I:E = 01:00:8A`.)*
+All endpoints are on Interface 0, Alternate Setting 1. The device exposes **different endpoints in High Speed vs Full Speed** mode:
+
+| Endpoint | Direction | Type | HS Packet | FS Packet | Purpose |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `0x01` | OUT | Bulk | 64 B | 64 B | Command submission |
+| `0x81` | IN | Bulk | 64 B | 64 B | Command response / ACK |
+| `0x02` | OUT | Bulk | 64 B | 64 B | **Unknown** (not seen in driver) |
+| `0x86` | IN | Bulk | 512 B | 64 B | **Unknown** (possibly aux data / debug) |
+| `0x87` | IN | Isochronous | — (absent) | 1020 B, 125 μs | **MPEG-TS stream (Full Speed mode only)** |
+| `0x88` | IN | Bulk | 512 B | — (absent) | **MPEG-TS stream (High Speed mode only)** |
+| `0x0A` | OUT | Bulk | 512 B | 64 B | **Unknown** |
+| `0x8A` | IN | **Interrupt** | 64 B, **128 ms** | 64 B, 127 ms | Signal status / lock state |
+
+*Note: `0x87` and `0x88` are mutually exclusive — the device selects the TS output endpoint based on negotiated USB speed.*
 
 ### Command Structure
 Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x81`).
