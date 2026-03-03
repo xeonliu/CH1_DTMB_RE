@@ -3857,8 +3857,12 @@ bool __stdcall sub_14046(char *a1, int a2)
 
 //----- (00014083) --------------------------------------------------------
 // [PROTOCOL] LME_WriteRegister: 0x04 命令
-// 写入寄存器或发送控制命令
-// Packet: [04] [Len] [SubCmd] [Data...]
+// [PROTOCOL] LME_Cmd04_WriteBlock
+// I2C 块写命令 (CMD=0x04):
+//   Packet: [04] [Len] [DevAddr] [Data...(a4 bytes)]
+//   Len = a4 + 1  (= RegAddr + data_count, 即 Len 字段之后的字节数)
+//   总包长 = a4 + 3 字节
+//   写入 ACK 响应: [88]
 bool __stdcall sub_14083(int a1, char a2, int a3, int a4, _DWORD *a5)
 {
   int v5; // esi
@@ -3866,41 +3870,42 @@ bool __stdcall sub_14083(int a1, char a2, int a3, int a4, _DWORD *a5)
   char v7; // dl
   int v8; // eax
 
-  byte_2DFB1 = a4 + 1; // Length
+  byte_2DFB1 = a4 + 1; // Len 字段: a4 字节数据 + 1 (= DevAddr 后的字节数)
   v5 = 0;
-  byte_2DFB0 = 4; // Command ID 0x04
-  for ( byte_2DFB2 = a2; v5 < a4; *v6 = v7 )
+  byte_2DFB0 = 4; // CMD = 0x04
+  for ( byte_2DFB2 = a2; v5 < a4; *v6 = v7 )  // a2 = DevAddr 或第一个数据字段
   {
     v6 = &byte_2DFB3[v5];
     v7 = *(_BYTE *)(a3 + v5++);
   }
-  // 发送数据包
-  v8 = sub_11A74(a1, 1, &byte_2DFB0, a4 + 3);
+  v8 = sub_11A74(a1, 1, &byte_2DFB0, a4 + 3);  // 发送 a4+3 字节到 EP 0x01
   if ( !v8 )
     return 0;
   *a5 = v8 - 1;
-  // 读取响应 (状态?)
-  return sub_11AB7(a1, 129, (int)&byte_2DFB0, 4) != 0;
+  return sub_11AB7(a1, 129, (int)&byte_2DFB0, 4) != 0;  // 读 ACK: [88] from EP 0x81
 }
 // 2DFB0: using guessed type char byte_2DFB0;
 // 2DFB1: using guessed type char byte_2DFB1;
 // 2DFB2: using guessed type char byte_2DFB2;
 
 //----- (00014106) --------------------------------------------------------
-// [PROTOCOL] LME_ReadRegister: 0x84 命令
-// 读取寄存器或状态
-// Packet: [84] [03] [SubCmd] [Param] [ReadLen]
+// [PROTOCOL] LME_Cmd84_ReadBlock
+// I2C 块读命令 (CMD=0x84):
+//   Packet: [84] [03] [DevAddr] [RegAddr] [ReadLen]
+//   Len 字段固定为 0x03
+//   响应: [55] [data * ReadLen]  (首字节 0x55 为固定前缀, 由此偏移 1 取数据)
+//   a2 = DevAddr, *a3 = RegAddr (输出时存读取结果), a4 = ReadLen
 char __stdcall sub_14106(int a1, char a2, char *a3, int a4, int a5)
 {
-  byte_2DFB0 = -124; // Command ID 0x84 (-124)
-  byte_2DFB1 = 3;    // Fixed Length?
-  byte_2DFB2 = a2;   // SubCmd
-  byte_2DFB3 = *a3;  // Param
-  byte_2DFB4 = a4;   // Expected Read Length
-  // 发送请求，然后读取响应
+  byte_2DFB0 = -124; // CMD = 0x84 (= -124 signed)
+  byte_2DFB1 = 3;    // Len 固定 = 3
+  byte_2DFB2 = a2;   // DevAddr (I2C 设备地址)
+  byte_2DFB3 = *a3;  // RegAddr
+  byte_2DFB4 = a4;   // ReadLen (要读取的字节数)
+  // 发送命令到 EP 0x01, 从 EP 0x81 读响应 (a4+1 字节: 0x55 前缀 + a4 数据字节)
   if ( !sub_11A74(a1, 1, &byte_2DFB0, 5) || !sub_11AB7(a1, 129, (int)&byte_2DFB0, a4 + 1) )
     return 0;
-  *a3 = byte_2DFB1; // 返回数据 (跳过第一个字节?)
+  *a3 = byte_2DFB1; // 响应 [55][data]: byte_2DFB1 偏移 1 = 数据字节; 存入 *a3
   return 1;
 }
 // 2DFB0: using guessed type char byte_2DFB0;
@@ -3910,6 +3915,12 @@ char __stdcall sub_14106(int a1, char a2, char *a3, int a4, int a5)
 // 2DFB4: using guessed type char byte_2DFB4;
 
 //----- (0001417A) --------------------------------------------------------
+// [PROTOCOL] LME_Cmd05_WriteReg
+// I2C 单寄存器写命令 (CMD=0x05):
+//   Packet: [05] [Len=a4+1] [a3[0]=DevAddr] [a3[1]=RegAddr] [a3[2]=Value]
+//   总包长 = a4 + 2 字节  (a4 固定为 3 时: 总长=5)
+//   写入 ACK 响应: [88]
+//   调用时: a1=USB上下文, a2=DevAddr(传给内部buf), a3=buf首地址, a4=数据字节数(=3)
 bool __stdcall sub_1417A(int a1, int a2, int a3, int a4, _DWORD *a5)
 {
   int v5; // esi
@@ -3918,17 +3929,17 @@ bool __stdcall sub_1417A(int a1, int a2, int a3, int a4, _DWORD *a5)
   int v8; // eax
 
   v5 = 0;
-  byte_2DFB0 = 5;
-  for ( byte_2DFB1 = a4 + 1; v5 < a4; *v6 = v7 )
+  byte_2DFB0 = 5;               // CMD = 0x05
+  for ( byte_2DFB1 = a4 + 1; v5 < a4; *v6 = v7 )  // Len = a4+1
   {
-    v6 = &byte_2DFB2[v5];
+    v6 = &byte_2DFB2[v5];       // buf[2..] = [DevAddr, RegAddr, Value]
     v7 = *(_BYTE *)(a3 + v5++);
   }
-  v8 = sub_11A74(a1, 1, &byte_2DFB0, a4 + 2);
+  v8 = sub_11A74(a1, 1, &byte_2DFB0, a4 + 2); // 发送 a4+2 字节到 EP 0x01
   if ( !v8 )
     return 0;
   *a5 = v8 - 1;
-  return sub_11AB7(a1, 129, (int)&byte_2DFB0, 4) != 0;
+  return sub_11AB7(a1, 129, (int)&byte_2DFB0, 4) != 0; // 读 ACK: [88] from EP 0x81
 }
 // 2DFB0: using guessed type char byte_2DFB0;
 // 2DFB1: using guessed type char byte_2DFB1;
@@ -3949,15 +3960,22 @@ bool __stdcall sub_141F5(int a1, char *a2, int a3, _DWORD *a4)
 // 2DFB0: using guessed type char byte_2DFB0;
 
 //----- (00014240) --------------------------------------------------------
+// [PROTOCOL] LME_Cmd85_ReadReg
+// I2C 单寄存器读命令 (CMD=0x85):
+//   Packet: [85] [02] [DevAddr] [RegAddr] [xx]  (5 字节, Len 固定=0x02)
+//   第 5 字节 [xx] 是缓冲区残留值, **无意义** (不是校验和, 不是固定 0x00)
+//   响应: [55][xx1][xx2][value][xx4]  (5 字节), 有效数据从 byte_2DFB1 偏移取
+//   a2 = DevAddr, *a3 = RegAddr (输出时存读取结果), a4 = 返回写入数量(通常1)
 char __stdcall sub_14240(int a1, char a2, char *a3, int a4, int a5)
 {
   int v6; // esi
   char *v7; // eax
 
-  byte_2DFB0 = -123;
-  byte_2DFB1[0] = 2;
-  byte_2DFB2[0] = a2;
-  byte_2DFB3[0] = *a3;
+  byte_2DFB0 = -123;    // CMD = 0x85 (= -123 signed)
+  byte_2DFB1[0] = 2;    // Len 固定 = 0x02
+  byte_2DFB2[0] = a2;   // DevAddr
+  byte_2DFB3[0] = *a3;  // RegAddr
+  // 发送 5 字节命令; 响应也是 5 字节 (0x55 前缀 + 数据)
   if ( !sub_11A74(a1, 1, &byte_2DFB0, 5) || !sub_11AB7(a1, 129, (int)&byte_2DFB0, 5) )
     return 0;
   v6 = a4;
@@ -3966,7 +3984,7 @@ char __stdcall sub_14240(int a1, char a2, char *a3, int a4, int a5)
     v7 = a3;
     do
     {
-      *v7 = v7[byte_2DFB1 - a3];
+      *v7 = v7[byte_2DFB1 - a3]; // 从响应缓冲区偏移 byte_2DFB1 处取数据回写到 *a3
       ++v7;
       --v6;
     }
@@ -3977,51 +3995,69 @@ char __stdcall sub_14240(int a1, char a2, char *a3, int a4, int a5)
 // 2DFB0: using guessed type char byte_2DFB0;
 
 //----- (000142BB) --------------------------------------------------------
+// [PROTOCOL] Demod_RouteAddr
+// 将解调器逻辑寄存器地址映射到物理 I2C 设备地址:
+//   0x00 ~ 0xBF -> 设备 0x32 (LGS 解调器, 主寄存器组)
+//   0xC0 ~ 0xFF -> 设备 0x36 (LGS 解调器, 高地址寄存器组, 同一芯片)
+// 注意: 0x36 **不是独立芯片**, 是同一 LGS8GL5/LGS8G75 解调器的高地址 bank
+// *a2 输出解析后的 I2C 设备字节值: 50 (=0x32) 或 54 (=0x36)
 char __stdcall sub_142BB(unsigned __int8 a1, _BYTE *a2)
 {
   if ( a1 <= 0xBFu )
   {
-    *a2 = 50;
+    *a2 = 50;  // I2C addr 0x32: 解调器低地址寄存器组 (0x00~0xBF)
     return 0;
   }
-  if ( (unsigned __int8)(a1 + 64) <= 0x3Fu )
+  if ( (unsigned __int8)(a1 + 64) <= 0x3Fu )  // 等价于 0xC0 <= a1 <= 0xFF
   {
-    *a2 = 54;
+    *a2 = 54;  // I2C addr 0x36: 解调器高地址寄存器组 (0xC0~0xFF)
     return 0;
   }
-  return -1;
+  return -1;  // 不应到达 (u8 范围内上面两个条件已覆盖全部)
 }
 
 //----- (000142EA) --------------------------------------------------------
+// [PROTOCOL] Demod_WriteReg (逻辑地址版)
+// 通过逻辑寄存器地址写解调器, 内部调用 sub_142BB 路由到正确 I2C 设备
+//   a1 = 逻辑寄存器地址 (0x00~0xFF, 自动路由到 0x32 或 0x36)
+//   a2 = 要写入的值
+// 注: v2 (cl寄存器) = a1 作为 RegAddr 使用 (IDA 误报为 undefined)
 char __stdcall sub_142EA(unsigned __int8 a1, char a2)
 {
-  char v2; // cl
+  char v2; // cl  = a1 (RegAddr, IDA 误标为 undefined)
   int v4; // [esp+0h] [ebp-10h] BYREF
   _BYTE v5[8]; // [esp+4h] [ebp-Ch] BYREF
 
   LOBYTE(v4) = 0;
-  sub_142BB(a1, &v4);
-  v5[0] = v4;
-  v5[2] = a2;
-  v5[1] = v2;
+  sub_142BB(a1, &v4);  // v4 = 解析后的 I2C 设备地址 (50=0x32 或 54=0x36)
+  v5[0] = v4;          // buf[0] = DevAddr
+  v5[2] = a2;          // buf[2] = Value
+  v5[1] = v2;          // buf[1] = RegAddr (= a1)
+  // 发送 0x05 命令: [05][04][DevAddr][RegAddr][Value]
   return sub_1417A(dword_2DFF0, v4, (int)v5, 3, &v4) ? 0 : 0xFC;
 }
 // 14326: variable 'v2' is possibly undefined
 // 2DFF0: using guessed type int dword_2DFF0;
 
 //----- (00014350) --------------------------------------------------------
+// [PROTOCOL] Demod_ReadReg (逻辑地址版)
+// 通过逻辑寄存器地址读解调器, 内部调用 sub_142BB 路由到正确 I2C 设备
+//   a1 = 逻辑寄存器地址 (0x00~0xFF)
+//   *a2 = 读取结果输出
+// 注: v2 (cl) = a1 作为 RegAddr 使用 (IDA 误报为 undefined)
 char __stdcall sub_14350(unsigned __int8 a1, _BYTE *a2)
 {
-  char v2; // cl
+  char v2; // cl  = a1 (RegAddr, IDA 误标为 undefined)
   int v4; // [esp+4h] [ebp-10h] BYREF
   char v5[8]; // [esp+8h] [ebp-Ch] BYREF
 
   LOBYTE(v4) = 0;
-  sub_142BB(a1, &v4);
-  v5[0] = v2;
+  sub_142BB(a1, &v4);  // v4 = 解析后的 I2C 设备地址
+  v5[0] = v2;          // buf[0] = RegAddr (= a1)
+  // 发送 0x85 命令: [85][02][DevAddr][RegAddr][xx]
   if ( !sub_14240(dword_2DFF0, v4, v5, 1, (int)&v4) )
     return -3;
-  *a2 = v5[0];
+  *a2 = v5[0];  // 读取值已由 sub_14240 写回 v5[0]
   return 0;
 }
 // 14384: variable 'v2' is possibly undefined
@@ -4653,6 +4689,13 @@ char sub_14F2E()
 }
 
 //----- (00014F36) --------------------------------------------------------
+// [PROTOCOL] Tuner_ReadRegs
+// 封装 sub_14106 (0x84命令), 用于读取 Tuner (MAX2165) 寄存器
+//   a1 = Tuner I2C 地址 (0xC0)
+//   a2 = 起始寄存器地址
+//   a3 = 读取结果输出缓冲区
+//   MaxCount = 要读取的字节数
+//   返回: MaxCount (成功) 或 0 (失败)
 char __stdcall sub_14F36(char a1, char a2, void *a3, int MaxCount)
 {
   _BYTE v5[4]; // [esp+8h] [ebp-48h] BYREF
@@ -4660,25 +4703,34 @@ char __stdcall sub_14F36(char a1, char a2, void *a3, int MaxCount)
 
   if ( MaxCount <= 0 )
     return 0;
-  Src[0] = a2;
+  Src[0] = a2;  // RegAddr 作为 sub_14106 的 *a3 输入
   if ( !sub_14106(dword_2E058, a1, Src, MaxCount, (int)v5) )
     return 0;
-  memcpy(a3, Src, MaxCount);
+  memcpy(a3, Src, MaxCount);  // 将结果复制到调用者缓冲区
   return MaxCount;
 }
 // 14F77: conditional instruction was optimized away because %MaxCount.4>=1
 // 2E058: using guessed type int dword_2E058;
 
 //----- (00014FA2) --------------------------------------------------------
+// [PROTOCOL] Tuner_WriteRegs
+// 封装 sub_14083 (0x04命令), 用于写 Tuner (MAX2165) 寄存器
+//   a1 = Tuner I2C 地址 (0xC0)
+//   a2 = 起始寄存器地址
+//   Src = 数据缓冲区
+//   MaxCount = 要写入的字节数
+// 内部构造 [RegAddr, data[0..MaxCount-1]] 共 MaxCount+1 字节送给 sub_14083
+// 实际命令: [04][MaxCount+2][0xC0][a2][data...]
 bool __stdcall sub_14FA2(char a1, char a2, void *Src, int MaxCount)
 {
   int v5; // [esp+4h] [ebp-48h] BYREF
-  char v6; // [esp+8h] [ebp-44h] BYREF
-  _BYTE v7[63]; // [esp+9h] [ebp-43h] BYREF
+  char v6; // [esp+8h] [ebp-44h] BYREF  = a2 (RegAddr)
+  _BYTE v7[63]; // [esp+9h] [ebp-43h] BYREF  = 数据字节
 
-  v6 = a2;
+  v6 = a2;                         // buf 首字节 = RegAddr
   if ( MaxCount > 0 )
-    memcpy(v7, Src, MaxCount);
+    memcpy(v7, Src, MaxCount);     // 追加数据字节
+  // sub_14083: a2=DevAddr(0xC0), a3=&v6, a4=MaxCount+1 => Len = MaxCount+2
   return sub_14083(dword_2E058, a1, (int)&v6, MaxCount + 1, &v5);
 }
 // 2E058: using guessed type int dword_2E058;
@@ -4728,14 +4780,17 @@ int __stdcall sub_150C4(int a1)
 {
   int result; // eax
 
-  // 计算小数部分: (Freq % 12) * 2^20 / 12
+  // 小数分频 K = ((Freq % RefFreq) << 20) / RefFreq, RefFreq=12 MHz
   result = ((a1 % dword_2CA0C) << 20) / dword_2CA0C;
-  // 计算整数部分: Freq / 12
-  byte_2E038 = a1 / dword_2CA0C;
-  byte_2E03B = result;
-  // 更新状态 (可能是为了 differential update)
+  // 整数分频 N = Freq / RefFreq
+  byte_2E038 = a1 / dword_2CA0C;  // N: Tuner 寄存器 0x00
+  byte_2E03B = result;            // K[7:0]: Tuner 寄存器 0x03
+  // byte_2E039: Tuner 寄存器 0x01
+  //   高 nibble (bit[7:4]) = 模式位, 固定为 0x1 (由 sub_151B1 初始化 byte_2E039=0x18=0x10|0x08)
+  //   低 nibble (bit[3:0]) = K[23:20] (小数分频最高 4 位)
+  //   XOR 写法: 只更新低 nibble, 保留高 nibble. 即 byte_2E039 = 0x10 | (K>>16 & 0x0F)
   byte_2E039 ^= (byte_2E039 ^ BYTE2(result)) & 0xF;
-  byte_2E03A = BYTE1(result);
+  byte_2E03A = BYTE1(result);     // K[15:8]: Tuner 寄存器 0x02
   return result;
 }
 
@@ -4769,26 +4824,37 @@ char __stdcall sub_15114(int a1, int a2)
 }
 
 //----- (0001517F) --------------------------------------------------------
+// [PROTOCOL] Tuner_CalcRegA
+// 计算并更新 Tuner 寄存器 0x0A 的值, 存入 byte_2E042
+//   高 nibble = clamp(byte_2E053 - 2, 0, 15) * 16  (校准数据驱动)
+//   低 nibble = 保留 byte_2E042 原有低 nibble
+//   结果写入 Tuner reg 0x0A: [04][03][C0][0A][byte_2E042]
+//   例: 618 MHz 时 byte_2E042 = 0x83
 char __stdcall sub_1517F(int a1)
 {
   int v1; // eax
   char result; // al
 
-  v1 = (unsigned __int8)byte_2E053 - 2;
+  v1 = (unsigned __int8)byte_2E053 - 2;  // 基于校准数据 byte_2E053
   if ( v1 < 0 )
     v1 = 0;
   if ( v1 > 15 )
     LOBYTE(v1) = 15;
-  result = 16 * v1;
-  byte_2E042 = result | byte_2E042 & 0xF;
+  result = 16 * v1;                // 高 nibble
+  byte_2E042 = result | byte_2E042 & 0xF;  // 合并, 保留低 nibble
   return result;
 }
 
 //----- (000151B1) --------------------------------------------------------
+// [PROTOCOL] Tuner_Init
+// 初始化 MAX2165 Tuner 寄存器配置 (寄存器 0x00 开始共 15 字节)
+// 建立默认值后调用 sub_14FFE 读取芯片校准数据, 再发送初始配置
+// byte_2E039 = 24 = 0x18 = 0x10 | 0x08:
+//   高 nibble 0x1 = 模式位 (固定); 低 nibble 0x8 = K[23:20] 初始值 (初始频率 474 MHz)
 BOOL __stdcall sub_151B1(int a1)
 {
-  dword_2E058 = a1;
-  byte_2E039 = 24;
+  dword_2E058 = a1;  // 保存 USB 设备上下文
+  byte_2E039 = 24;   // 0x18 = 模式位 0x10 | K[23:20]=0x08 (初始 474 MHz)
   byte_2E03D = 1;
   byte_2E03E = 10;
   byte_2E03F = 8;
@@ -4819,17 +4885,29 @@ BOOL __stdcall sub_1524A(int a1)
   // 2. 计算控制字节 (Bandwidth, Gain etc.)
   sub_15114(a1, dword_2CA0C);
   
-  // 3. 发送前 5 个字节配置到 Tuner (Addr 0xC0, Reg 0x00)
-  // byte_2E038 开始的缓冲区包含: [Int] [FracHigh] [FracMid] [FracLow] [Control]
+  // 3. 写 5 字节 N/K/BW 到 MAX2165 寄存器 0x00~0x04
+  //    byte_2E038: N (整数分频)
+  //    byte_2E039: 0x10 | K[23:20]  (高 nibble=模式位0x1, 低 nibble=K高4位)
+  //    byte_2E03A: K[15:8]
+  //    byte_2E03B: K[7:0]
+  //    byte_2E03C: BW/Gain 控制字节
+  //    命令: 04 07 C0 00 [N] [0x1|K_hi] [K_mid] [K_lo] [BW]  (Len=0x07)
   if ( !sub_14FA2(192, 0, &byte_2E038, 5) )
     return 0;
-    
+
+  // 4. 计算并写 Tuner 寄存器 0x0A (控制字节)
+  //    命令: 04 03 C0 0A [byte_2E042]  (e.g. 0x83 @ 618 MHz)
   sub_1517F(4);
-  
-  // 4. 后续配置 (可能是其他寄存器或触发)
-  if ( !sub_14FA2(192, 10, &byte_2E042, 1) || !sub_14F36(192, 4, Src, 1) )
+  if ( !sub_14FA2(192, 10, &byte_2E042, 1) )
     return 0;
-  Src[0] |= 0xF0u;
+
+  // 5. 读-修改-写 Tuner 寄存器 0x04 — PLL 锁存操作
+  //    读:  84 03 C0 04 01  => 55 [val]
+  //    修改: val |= 0xF0  (置高 4 位触发 PLL 锁存; 注意不是 |=0x40)
+  //    写回: 04 03 C0 04 [val|0xF0]  (e.g. 0xF7 @ 618 MHz)
+  if ( !sub_14F36(192, 4, Src, 1) )
+    return 0;
+  Src[0] |= 0xF0u;           // PLL latch: 设置 bit[7:4]
   return sub_14FA2(192, 4, Src, 1);
 }
 // 2CA0C: using guessed type int dword_2CA0C;
