@@ -16,6 +16,7 @@ The device communicates primarily via USB Bulk transfers.
 - **Pipe 0 (Endpoint 0x81 IN)**: Command responses and status.
 - **Pipe 1 (Endpoint 0x01 OUT)**: Command submission (Firmware download, Register R/W).
 - **Pipe 2 (Endpoint 0x88 IN)**: MPEG-TS Stream data. *(Note: `0x88` = EP8 IN, not EP2. Confirmed by USBlyzer capture `C:I:E = 01:00:88`.)*
+- **Pipe 3 (Endpoint 0x8A IN)**: Asynchronous signal status / demodulator lock status. Returns 8-byte packets at ~500 ms intervals. *(Confirmed by USBlyzer capture `C:I:E = 01:00:8A`.)*
 
 ### Command Structure
 Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x81`).
@@ -146,6 +147,41 @@ After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals:
   - `0x01`: Demod locked / locked bit set
   - `0x02`: Not yet locked
   - `0x81`: AGC/signal detected but not data-locked
+
+### 5.4 Signal Status Packet (EP `0x8A`)
+
+The device asynchronously reports signal quality via EP `0x8A`. Each packet is **8 bytes** and arrives approximately every **500 ms** (interval varies with lock state).
+
+**Packet Format**:
+
+```
+BB 05 [LOCK] [SNR] [BER_H] [CTR] [BER_L] 00
+```
+
+| Offset | Name | Description |
+| :--- | :--- | :--- |
+| 0 | `0xBB` | Fixed header byte 1 |
+| 1 | `0x05` | Fixed header byte 2 |
+| 2 | `LOCK` | Lock status: `0x01` = locked, `0x00` = not locked |
+| 3 | `SNR` | Signal quality / SNR indicator. `0xFF` = high, `0x00` = low. Noisy without signal. |
+| 4 | `BER_H` | Bit Error Rate (high byte) or carrier status. `0x00` = no error / not acquired. |
+| 5 | `CTR` | Internal AGC/counter: alternates between `0x03` and `0x04`. |
+| 6 | `BER_L` | BER low byte / error indicator. `0xFF` = all bits wrong (no signal), `0x00` = clean. |
+| 7 | Reserved | Always `0x00`. |
+
+**Examples from capture (666 MHz, no real signal)**:
+
+| Packet | LOCK | SNR | Interpretation |
+| :--- | :--- | :--- | :--- |
+| `BB 05 01 00 FF 04 FF 00` | 1 | 0x00 | False lock — SNR=0, BER=FF (all errors) |
+| `BB 05 01 FF FF 03 FF 00` | 1 | 0xFF | False lock — SNR noise burst |
+| `BB 05 00 00 00 04 00 00` | 0 | 0x00 | Not locked, no signal |
+| `BB 05 00 FF 00 03 00 00` | 0 | 0xFF | Not locked, AGC sees noise |
+
+**Diagnostic rules**:
+- Valid lock: `LOCK=1` AND `SNR` stably high AND `BER_L=0x00`
+- False lock / noise: `LOCK=1` but `SNR` jumps erratically and `BER_L=0xFF`
+- No signal: `LOCK=0`, `SNR` random, `BER_L=0x00`
 
 ## 6. Stream Handling
 MPEG-TS data is received via Bulk IN transfers on Pipe 2.
