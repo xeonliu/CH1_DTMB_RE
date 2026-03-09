@@ -80,11 +80,16 @@ The driver checks if the firmware is loaded (Cold Boot). If not, it performs a 2
   1. Driver reads firmware blob from internal resource.
   2. Splits data into 50-byte chunks.
   3. Sends each chunk to Pipe 1.
-  4. Waits for acknowledgment (Status `0x88` typically).
+  4. Waits for acknowledgment (`0x88` or `0x77` are both accepted as success).
 
 **Stages** (`sub_13A95`):
 1. **Firmware 1**: Likely the USB controller patch or bootloader.
 2. **Firmware 2**: Tuner/Demodulator initialization script.
+
+**Post-download activation** (`sub_13EC8`):
+- Driver/script sends `8A 00` after both stages.
+- Device may immediately reset/re-enumerate, so response read may fail transiently.
+- `lme2510_init.py` then waits 2 seconds, re-opens USB, and checks String Descriptor index 2 for warm marker `"GGG"`.
 
 ## 4. Demodulator Identification
 The driver identifies the specific Demodulator chip model to apply the correct initialization sequence.
@@ -101,6 +106,16 @@ The driver identifies the specific Demodulator chip model to apply the correct i
 The driver controls the Tuner and Demodulator via I2C, bridged through the LME2510C.
 
 **Function**: `sub_13C03` (Tuner Apply Frequency)
+
+### 5.0 Tuner Initialization (`sub_151B1`, implemented in `lme2510_init.py`)
+Before normal tuning, script performs a dedicated init block write:
+- Reads MAX2165 calibration via `sub_14FFE` sequence (`reg 0x0D` writes `1..5`, reads `reg 0x10`).
+- Extracts:
+  - `low_band_gain` / `high_band_gain`
+  - `bw_min` / `bw_max`
+  - `reg_0a_cal`
+- Builds and writes a **15-byte** init table to tuner starting at reg `0x00` (base frequency 474 MHz).
+- Tuner access is always wrapped by repeater open/close (`Demod reg 0x01 = 0xE0` / `0x60`).
 
 ### 5.1 Frequency Calculation (MAX2165)
 Base Reference Frequency (RefFreq) is **12 MHz**.
@@ -158,7 +173,8 @@ Full sequence from `sub_13C03` → `sub_1524A`. Frequency input to `sub_13C03` i
 
 ### 5.3 Lock Status Polling
 
-After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals:
+After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals.  
+`lme2510_init.py` reproduces this by polling `0x4B` and checking bit0, but uses a default interval of **100 ms** (`timeout=5 s`, configurable in function args):
 - Command: `85 02 32 4B xx` → Response: `55 [status]`
 - Known status values observed:
   - `0x01`: Demod locked / locked bit set
@@ -167,7 +183,8 @@ After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals:
 
 ### 5.4 Signal Status Packet (EP `0x8A`)
 
-The device asynchronously reports signal quality via EP `0x8A`. Each packet is **8 bytes** and arrives approximately every **500 ms** (interval varies with lock state).
+The device asynchronously reports signal quality via EP `0x8A`. Each packet is **8 bytes**.  
+Descriptor interval is ~**128 ms** (interrupt endpoint), while practical reads in script are performed with timeout windows (e.g., 700 ms per read in sample loop).
 
 **Packet Format**:
 
@@ -213,6 +230,10 @@ MPEG-TS data is received via Bulk IN transfers on Pipe 2.
 - Copies the received TS data into the Kernel Streaming (KS) buffer (`KSSTREAM_POINTER`).
 - Advances the KS stream pointer to notify the graph (e.g., Media Player).
 - Re-submits the URB to continue streaming.
+
+In `lme2510_init.py`, stream readout is userspace/libusb style:
+- Reads EP `0x88` in chunks (`buf_size=4096`, timeout `500 ms`).
+- On `--stream`, writes raw bytes directly to `stdout` continuously.
 
 ## 7. Key Function Mapping
 
