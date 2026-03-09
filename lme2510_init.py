@@ -259,6 +259,113 @@ class LME2510:
         print(f"  Demod reg[0x00] = {val:#04x}  →  {chip}")
         return chip
 
+    # ── Chip-type selection CMD 0x16 (sub_13F00) ─────────────────────────────
+
+    def cmd_select_chip_type(self, chip: str) -> bool:
+        """
+        sub_13F00: tell the USB bridge firmware which demodulator is connected.
+
+        This command **must** be sent after demodulator identification and
+        before reading EP 0x8A signal status packets.  The bridge uses the
+        chip-type byte to determine which demodulator I2C registers to poll
+        when building the status packets.  Without this command the bridge
+        firmware never generates EP 0x8A interrupt packets.
+
+        Packet: [0x16, 0x01, chip_type]  → response: 5 bytes (ACK)
+          chip_type = 0x00  for LGS8GL5 (sub_13F00(a1, 0))
+          chip_type = 0x01  for LGS8G75 (sub_13F00(a1, 1))
+        """
+        chip_type = 0x00 if chip == "LGS8GL5" else 0x01
+        self._send([0x16, 0x01, chip_type])
+        resp = self._recv(5)
+        return bool(resp and len(resp) >= 1)
+
+    # ── Post-identify demod init (sub_145A2 + sub_1440D, LGS8GL5 path) ────────
+
+    def _init_demod_after_identify(self, chip: str):
+        """
+        Demodulator register initialization performed by sub_13AD7 right after
+        tuner init, for both chip types.
+
+        LGS8GL5 (sub_145A2(1) then sub_1440D(0)):
+          1. Read demod reg 0x07
+          2. Write reg 0x07 |= 0x0C   (set bits [3:2])
+          3. Write reg 0x09 = 0x00
+          4. Write reg 0x0A = 0x00
+          5. Write reg 0x0B = 0x00
+          6. Write reg 0x0C = 0x00
+          7. Read demod reg 0x07 again
+          8. Write reg 0x07 &= 0x7C   (clear bits [7,1,0])
+
+        LGS8G75: the equivalent (sub_14D78) sets up a large demod calibration
+        table and is a very long operation (~3678 iterations); it writes to
+        regs 0xC6, 0x18, 0x3D, 0x39, 0x3A, 0x38, 0x3B and a lookup-table
+        batch.  In practice, lock is still achieved without it on warm-restart
+        so we apply only the same essential reg 0x07/0x09–0x0C sequence here.
+        """
+        reg7 = self.demod_read(0x07)
+        if reg7 is None:
+            return
+        if chip == "LGS8GL5":
+            # sub_145A2(1): set bits [3:2]
+            self.demod_write(0x07, reg7 | 0x0C)
+        else:
+            # LGS8G75 uses same enable-bits
+            self.demod_write(0x07, reg7 | 0x0C)
+        # Zero out DTMB sync parameters regs 0x09–0x0C (sub_145A2, both paths)
+        for r in (0x09, 0x0A, 0x0B, 0x0C):
+            self.demod_write(r, 0x00)
+        # sub_1440D(0): clear bits [7,1,0]
+        reg7b = self.demod_read(0x07)
+        if reg7b is not None:
+            self.demod_write(0x07, reg7b & 0x7C)
+
+    # ── Post-tune demod init (sub_14C72 + sub_14957 + sub_14C16) ─────────────
+
+    def _init_demod_post_tune(self, chip: str):
+        """
+        Demodulator register configuration applied by sub_13C03 after tuning.
+
+        Called for both chip types (the LGS8G75 path also calls sub_14D6E
+        which is a no-op stub in the driver).  Prepares the demod for signal
+        measurement that drives EP 0x8A status packets.
+
+        Sequence (mirrors sub_14C72(0) + sub_14957(0) + sub_14C16()):
+          sub_14C72(0):
+            Read  reg 0x07
+            Write reg 0x07 |= 0x0C    (set bits [3:2])
+            Write reg 0x08 = 0x00
+            Write reg 0x09 = 0x00
+            Write reg 0x0A = 0x00
+            Write reg 0x0B = 0x00
+          sub_14957(_, _, 0):
+            Read  reg 0x07
+            Write reg 0x07 &= 0x7F    (clear bit 7)
+          sub_14C16():
+            Read  reg 0x0C
+            Write reg 0x0C = (old & 0x7B) | 0x80  (clear bit 2, set bit 7)
+            Write reg 0x39 = 0x00
+            Write reg 0x3D = 0x04
+        """
+        # sub_14C72(0) ─────────────────────────────────
+        reg7 = self.demod_read(0x07)
+        if reg7 is not None:
+            self.demod_write(0x07, reg7 | 0x0C)
+        for r in (0x08, 0x09, 0x0A, 0x0B):
+            self.demod_write(r, 0x00)
+
+        # sub_14957(_, _, 0) ───────────────────────────
+        reg7 = self.demod_read(0x07)
+        if reg7 is not None:
+            self.demod_write(0x07, reg7 & 0x7F)
+
+        # sub_14C16() ──────────────────────────────────
+        reg_c = self.demod_read(0x0C)
+        if reg_c is not None:
+            self.demod_write(0x0C, (reg_c & 0x7B) | 0x80)
+        self.demod_write(0x39, 0x00)
+        self.demod_write(0x3D, 0x04)
+
     # ── Tuner calibration (sub_14FFE) ─────────────────────────────────────────
 
     def read_calibration(self):
@@ -579,12 +686,24 @@ def main():
     print("\n[Demodulator identification]")
     chip = lme.identify_demod()
 
+    # ── 3a. Tell USB bridge which demodulator is connected (sub_13F00) ────────
+    #   CMD [0x16, 0x01, chip_type] enables EP 0x8A status packet generation.
+    #   Without this the bridge firmware does not know which demodulator
+    #   registers to poll, so EP 0x8A never sends interrupt packets.
+    lme.cmd_select_chip_type(chip)
+
     # ── 4. Initialize tuner ───────────────────────────────────────────────────
     print("\n[Tuner initialization]")
     lme.init_tuner()
 
+    # ── 4a. Post-identify demodulator register init (sub_145A2 + sub_1440D) ───
+    lme._init_demod_after_identify(chip)
+
     # ── 5. Tune ───────────────────────────────────────────────────────────────
     lme.tune(args.freq)
+
+    # ── 5a. Post-tune demodulator register init (sub_14C72 + sub_14957 + sub_14C16)
+    lme._init_demod_post_tune(chip)
 
     # ── 6. Lock polling via demod register ───────────────────────────────────
     locked = lme.poll_lock_reg(timeout_s=5.0)

@@ -1233,6 +1233,264 @@ class TestIdentifyDemodRetry(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 21.  CMD 0x16 — chip-type selection (sub_13F00)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCmdSelectChipType(unittest.TestCase):
+    """
+    sub_13F00 / cmd_select_chip_type:
+      Tells the USB bridge firmware which demodulator is connected so that
+      the bridge knows which I2C registers to read when building EP 0x8A
+      status packets.  Without this command, EP 0x8A never produces data.
+
+    Packet format: [0x16, 0x01, chip_type]
+      chip_type = 0x00  for LGS8GL5
+      chip_type = 0x01  for LGS8G75
+    Response: 5 bytes (ACK, contents not checked)
+    """
+
+    def _run(self, chip: str):
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x55, 0, 0, 0, 0]))
+        lme.cmd_select_chip_type(chip)
+        return mock.written
+
+    def test_lgs8gl5_cmd_byte(self):
+        """First byte of packet must be 0x16."""
+        pkts = self._run("LGS8GL5")
+        self.assertEqual(pkts[-1][0], 0x16)
+
+    def test_lgs8gl5_second_byte(self):
+        """Second byte must always be 0x01."""
+        pkts = self._run("LGS8GL5")
+        self.assertEqual(pkts[-1][1], 0x01)
+
+    def test_lgs8gl5_chip_type_byte(self):
+        """LGS8GL5 → chip_type = 0x00."""
+        pkts = self._run("LGS8GL5")
+        self.assertEqual(pkts[-1][2], 0x00)
+
+    def test_lgs8g75_chip_type_byte(self):
+        """LGS8G75 → chip_type = 0x01."""
+        pkts = self._run("LGS8G75")
+        self.assertEqual(pkts[-1][2], 0x01)
+
+    def test_packet_length_is_3(self):
+        """CMD 0x16 packet must be exactly 3 bytes."""
+        pkts = self._run("LGS8GL5")
+        self.assertEqual(len(pkts[-1]), 3)
+
+    def test_reads_5_byte_response(self):
+        """Must attempt to read 5 bytes from EP 0x81 after sending CMD 0x16."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x55, 0, 0, 0, 0]))
+        lme.cmd_select_chip_type("LGS8GL5")
+        self.assertEqual(len(mock._read_queue), 0)  # 5-byte response consumed
+
+    def test_returns_true_on_valid_response(self):
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x55, 0, 0, 0, 0]))
+        self.assertTrue(lme.cmd_select_chip_type("LGS8GL5"))
+
+    def test_returns_false_on_empty_response(self):
+        mock = MockUsbDevice()
+
+        class EmptyDev(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                return b""
+
+        lme = make_lme(EmptyDev())
+        result = lme.cmd_select_chip_type("LGS8GL5")
+        self.assertFalse(result)
+
+    def test_lgs8gl5_full_packet(self):
+        """Full packet for LGS8GL5 must be exactly [0x16, 0x01, 0x00]."""
+        pkts = self._run("LGS8GL5")
+        self.assertEqual(pkts[-1], bytes([0x16, 0x01, 0x00]))
+
+    def test_lgs8g75_full_packet(self):
+        """Full packet for LGS8G75 must be exactly [0x16, 0x01, 0x01]."""
+        pkts = self._run("LGS8G75")
+        self.assertEqual(pkts[-1], bytes([0x16, 0x01, 0x01]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 22.  Post-identify demod init (sub_145A2 + sub_1440D)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestInitDemodAfterIdentify(unittest.TestCase):
+    """
+    _init_demod_after_identify(chip):
+      Called after identify_demod + cmd_select_chip_type, before init_tuner.
+      Configures demod registers 0x07 and 0x09–0x0C.
+
+    LGS8GL5 sequence (sub_145A2(1) then sub_1440D(0)):
+      1. Read  demod reg 0x07
+      2. Write reg 0x07 |= 0x0C   (set bits [3:2])
+      3. Write reg 0x09 = 0x00
+      4. Write reg 0x0A = 0x00
+      5. Write reg 0x0B = 0x00
+      6. Write reg 0x0C = 0x00
+      7. Read  demod reg 0x07 again
+      8. Write reg 0x07 &= 0x7C   (clear bits [7,1,0])
+    """
+
+    def _run(self, chip: str, reg7_initial: int = 0x00):
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        # First read of reg 0x07
+        mock.queue_read(bytes([0x55, reg7_initial, 0, 0, 0]))
+        # ACKs for writes to 0x07, 0x09, 0x0A, 0x0B, 0x0C
+        for _ in range(5):
+            mock.queue_read(bytes([0x88, 0, 0, 0]))
+        # Second read of reg 0x07
+        mock.queue_read(bytes([0x55, reg7_initial | 0x0C, 0, 0, 0]))
+        # ACK for final write to 0x07
+        mock.queue_read(bytes([0x88, 0, 0, 0]))
+        lme._init_demod_after_identify(chip)
+        return mock.written
+
+    def test_reads_reg_07_first(self):
+        """First command must be CMD 0x85 read of demod reg 0x07."""
+        pkts = self._run("LGS8GL5")
+        read_pkts = [p for p in pkts if p[0] == 0x85]
+        self.assertGreater(len(read_pkts), 0)
+        self.assertEqual(read_pkts[0][3], 0x07)
+
+    def test_sets_bits_3_2_in_reg07(self):
+        """After reading reg 0x07, must write it back with bits [3:2] set."""
+        reg7 = 0x00
+        pkts = self._run("LGS8GL5", reg7_initial=reg7)
+        write_07 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x07]
+        self.assertGreater(len(write_07), 0)
+        # First write should set bits [3:2]
+        self.assertEqual(write_07[0][4], reg7 | 0x0C)
+
+    def test_zeros_regs_09_to_0c(self):
+        """Regs 0x09, 0x0A, 0x0B, 0x0C must all be written to 0x00."""
+        pkts = self._run("LGS8GL5")
+        for reg in (0x09, 0x0A, 0x0B, 0x0C):
+            writes = [p for p in pkts if p[0] == 0x05 and p[3] == reg]
+            self.assertEqual(len(writes), 1, f"Must write reg {reg:#04x} exactly once")
+            self.assertEqual(writes[0][4], 0x00, f"reg {reg:#04x} must be written 0x00")
+
+    def test_clears_bits_7_1_0_in_reg07_final(self):
+        """Final write to reg 0x07 must clear bits [7,1,0]."""
+        reg7_after_set = 0x0C  # bits [3:2] set, others 0
+        pkts = self._run("LGS8GL5")
+        write_07 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x07]
+        # Last write to reg 0x07 should have bits [7,1,0] cleared
+        final = write_07[-1][4]
+        self.assertEqual(final & 0x83, 0x00, "bits [7,1,0] must be cleared in final reg 0x07 write")
+
+    def test_lgs8g75_path_also_runs(self):
+        """LGS8G75 path must also write to reg 0x07 and zero out regs 0x09–0x0C."""
+        pkts = self._run("LGS8G75")
+        write_07 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x07]
+        self.assertGreater(len(write_07), 0, "LGS8G75 path must write reg 0x07")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 23.  Post-tune demod init (sub_14C72 + sub_14957 + sub_14C16)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestInitDemodPostTune(unittest.TestCase):
+    """
+    _init_demod_post_tune(chip):
+      Called after tune() to configure the demodulator for signal measurement.
+      This prepares the demod's signal quality registers so the USB bridge
+      firmware can read valid SNR/BER values for EP 0x8A status packets.
+
+    Sequence:
+      sub_14C72(0): reg 0x07 |= 0x0C; zero regs 0x08–0x0B
+      sub_14957(0): reg 0x07 &= 0x7F (clear bit 7)
+      sub_14C16():  reg 0x0C = (old & 0x7B) | 0x80; reg 0x39=0; reg 0x3D=4
+    """
+
+    def _run(self, chip: str = "LGS8GL5",
+             reg7_val: int = 0x00, reg_c_val: int = 0x00):
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        # sub_14C72(0): read reg 0x07
+        mock.queue_read(bytes([0x55, reg7_val, 0, 0, 0]))
+        # ACKs: write 0x07, write 0x08, 0x09, 0x0A, 0x0B
+        for _ in range(5):
+            mock.queue_read(bytes([0x88, 0, 0, 0]))
+        # sub_14957(0): read reg 0x07 again
+        mock.queue_read(bytes([0x55, reg7_val | 0x0C, 0, 0, 0]))
+        # ACK: write 0x07
+        mock.queue_read(bytes([0x88, 0, 0, 0]))
+        # sub_14C16(): read reg 0x0C
+        mock.queue_read(bytes([0x55, reg_c_val, 0, 0, 0]))
+        # ACKs: write 0x0C, write 0x39, write 0x3D
+        for _ in range(3):
+            mock.queue_read(bytes([0x88, 0, 0, 0]))
+        lme._init_demod_post_tune(chip)
+        return mock.written
+
+    def test_reg07_bits_3_2_set(self):
+        """sub_14C72(0): reg 0x07 |= 0x0C — bits [3:2] must be set."""
+        pkts = self._run(reg7_val=0x00)
+        write_07 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x07]
+        self.assertGreater(len(write_07), 0)
+        self.assertEqual(write_07[0][4] & 0x0C, 0x0C)
+
+    def test_reg08_to_0b_zeroed(self):
+        """sub_14C72(0): regs 0x08–0x0B must all be written to 0x00."""
+        pkts = self._run()
+        for reg in (0x08, 0x09, 0x0A, 0x0B):
+            writes = [p for p in pkts if p[0] == 0x05 and p[3] == reg]
+            self.assertEqual(len(writes), 1, f"Must write reg {reg:#04x}")
+            self.assertEqual(writes[0][4], 0x00)
+
+    def test_reg07_bit7_cleared(self):
+        """sub_14957(0): reg 0x07 &= 0x7F — bit 7 must be cleared."""
+        pkts = self._run(reg7_val=0x80)
+        write_07 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x07]
+        # The second write to reg 0x07 must clear bit 7
+        self.assertGreaterEqual(len(write_07), 2)
+        self.assertEqual(write_07[1][4] & 0x80, 0x00)
+
+    def test_reg0c_written(self):
+        """sub_14C16(): reg 0x0C must be written."""
+        pkts = self._run()
+        writes_0c = [p for p in pkts if p[0] == 0x05 and p[3] == 0x0C]
+        self.assertEqual(len(writes_0c), 1)
+
+    def test_reg0c_clears_bit2_sets_bit7(self):
+        """sub_14C16(): reg 0x0C = (old & 0x7B) | 0x80 — bit 7 set, bit 2 clear."""
+        pkts = self._run(reg_c_val=0x04)  # bit 2 set initially
+        writes_0c = [p for p in pkts if p[0] == 0x05 and p[3] == 0x0C]
+        val = writes_0c[0][4]
+        self.assertEqual(val & 0x80, 0x80, "bit 7 must be set")
+        self.assertEqual(val & 0x04, 0x00, "bit 2 must be cleared")
+
+    def test_reg39_written_zero(self):
+        """sub_14C16(): reg 0x39 must be written to 0x00."""
+        pkts = self._run()
+        writes_39 = [p for p in pkts if p[0] == 0x05 and p[3] == 0x39]
+        self.assertEqual(len(writes_39), 1)
+        self.assertEqual(writes_39[0][4], 0x00)
+
+    def test_reg3d_written_4(self):
+        """sub_14C16(): reg 0x3D must be written to 0x04."""
+        pkts = self._run()
+        writes_3d = [p for p in pkts if p[0] == 0x05 and p[3] == 0x3D]
+        self.assertEqual(len(writes_3d), 1)
+        self.assertEqual(writes_3d[0][4], 0x04)
+
+    def test_works_for_lgs8g75(self):
+        """Post-tune demod init must run the same sequence for LGS8G75."""
+        pkts = self._run(chip="LGS8G75")
+        writes_3d = [p for p in pkts if p[0] == 0x05 and p[3] == 0x3D]
+        self.assertEqual(len(writes_3d), 1)
+        self.assertEqual(writes_3d[0][4], 0x04)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

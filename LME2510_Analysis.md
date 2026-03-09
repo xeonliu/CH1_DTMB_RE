@@ -51,6 +51,13 @@ Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x8
 - **0x05**: Single Register Write. Function: `sub_1417A`.
   - Format: `[05] [04] [DevAddr] [RegAddr] [Value]`
   - `Len` is always `0x04` (= 1 DevAddr + 1 RegAddr + 1 Value + 1)
+- **0x16**: Chip-Type Selection. Function: `sub_13F00`.
+  - Format: `[16] [01] [chip_type]`  (3 bytes total)
+  - `chip_type = 0x00` for LGS8GL5; `chip_type = 0x01` for LGS8G75
+  - **Must be sent after demodulator identification** to enable EP `0x8A` status packet generation.
+    Without this command the USB bridge firmware does not know which demodulator I2C registers to
+    poll, so it never generates interrupt packets on EP `0x8A`.
+  - Response: 5 bytes (ACK, first byte checked non-zero for success)
 - **0x84**: Block Read. Function: `sub_14106`.
   - Format: `[84] [03] [DevAddr] [RegAddr] [ReadLen]`
   - `Len` is always `0x03` (fixed); `ReadLen` = number of bytes to read
@@ -101,6 +108,45 @@ The driver identifies the specific Demodulator chip model to apply the correct i
      - If `0x0E` (14) -> **LGS8GL5**.
      - Otherwise -> **LGS8G75**.
 - **Command Used**: `0x85` (via `sub_1485E` -> `sub_14240`).
+
+### 4.1 Chip-Type Selection — CMD 0x16 (sub_13F00)
+
+**Immediately after** identifying the chip, the driver sends CMD `0x16` to tell the USB bridge
+firmware which demodulator type is connected.  This is mandatory for EP `0x8A` status packets:
+
+| Chip | Command bytes |
+| :--- | :--- |
+| LGS8GL5 | `16 01 00` |
+| LGS8G75 | `16 01 01` |
+
+Without this command the bridge firmware never generates interrupt packets on EP `0x8A`.
+
+### 4.2 Post-Identify Demodulator Register Init
+
+After sending CMD `0x16` and completing tuner init (`sub_151B1`), the driver applies a chip-specific
+demodulator register sequence.
+
+**LGS8GL5 (`sub_145A2(1)` + `sub_1440D(0)`):**
+1. Read demod reg `0x07`
+2. Write reg `0x07 |= 0x0C` (set bits [3:2])
+3. Write reg `0x09` = `0x00`
+4. Write reg `0x0A` = `0x00`
+5. Write reg `0x0B` = `0x00`
+6. Write reg `0x0C` = `0x00`
+7. Read demod reg `0x07` again
+8. Write reg `0x07 &= 0x7C` (clear bits [7,1,0])
+
+### 4.3 Post-Tune Demodulator Register Init
+
+After tuning, the driver configures additional demod registers that prepare the chip for signal
+measurement (sub_14C72(0) + sub_14957(0) + sub_14C16()).  These are needed for valid SNR/BER
+values in EP 0x8A packets.
+
+**sub_14C72(0):** Read reg `0x07`; write `0x07 |= 0x0C`; write regs `0x08–0x0B` = `0x00`
+
+**sub_14957(_, _, 0):** Read reg `0x07`; write `0x07 &= 0x7F` (clear bit 7)
+
+**sub_14C16():** Read reg `0x0C`; write `0x0C = (old & 0x7B) | 0x80`; write `0x39 = 0x00`; write `0x3D = 0x04`
 
 ## 5. Tuner & Demodulator Control
 The driver controls the Tuner and Demodulator via I2C, bridged through the LME2510C.
@@ -262,13 +308,22 @@ In `lme2510_init.py`, stream readout is userspace/libusb style:
 | `sub_14350` | `Demod_ReadReg` | Single demod read via logical address (uses `sub_142BB` + `sub_14240`) |
 | `sub_1485E` | `Demod_ReadRegDirect` | Direct demod read via `sub_14240` (device addr explicitly 50=0x32) |
 | `sub_147DA` | `Demod_WriteRegDirect` | Direct demod write via `sub_1417A` (device addr explicitly given) |
+| `sub_13F00` | `LME_CmdSelectChipType` | Sends CMD `0x16` — selects chip type (0=LGS8GL5, 1=LGS8G75); **enables EP 0x8A status** |
+| `sub_13EC8` | `LME_CmdPostFw` | Sends CMD `0x8A 0x00` — activates firmware after download |
 
 ### Demodulator & Stream
 | Original Function | Description | Note |
 | :--- | :--- | :--- |
-| `sub_13AD7` | `Demod_Identify` | Reads reg `0x00`, identifies LGS8GL5 vs LGS8G75 |
+| `sub_13AD7` | `Demod_Identify` | Reads reg `0x00`, identifies LGS8GL5 vs LGS8G75; also calls `sub_13F00`, `sub_145A2`, `sub_1440D` |
+| `sub_13F00` | `Demod_SelectChipType` | CMD `0x16` chip-type selector — must follow `Demod_Identify` to enable EP `0x8A` |
+| `sub_145A2` | `Demod_InitRegs_PostIdentify` | Configures demod regs 0x07/0x09–0x0C after identification (LGS8GL5 path) |
+| `sub_1440D` | `Demod_ClearReg07Bits` | Clears bits [7,1,0] of demod reg 0x07 (part of post-identify init) |
+| `sub_14C72` | `Demod_InitSignalMeas` | Sets demod reg 0x07 bits [3:2]; zeros regs 0x08–0x0B (post-tune) |
+| `sub_14957` | `Demod_ClearReg07Bit7` | Clears bit 7 of demod reg 0x07 (post-tune) |
+| `sub_14C16` | `Demod_InitBerRegs` | Sets demod reg 0x0C; zeros reg 0x39; sets reg 0x3D=4 (post-tune) |
 | `sub_13D13` | `Demod_GetSNR` | Returns SNR/quality metric from `byte_2DEE2` |
 | `sub_149DA` | `Demod_AcquireSignal` | LGS8G75 DTMB acquisition loop |
+| `sub_14640` | `Demod_AcquireSignal_GL5` | LGS8GL5 DTMB acquisition loop (called in `sub_13C03`) |
 | `sub_128DC` | `Stream_SubmitUrb` | Allocates and submits Bulk IN URBs to EP `0x88` |
 | `sub_1274F` | `Stream_Callback` | URB completion: copies TS data to KS buffer, re-submits |
 | `sub_1206C` | `Usb_SubmitUrb` | Low-level URB submission |
