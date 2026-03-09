@@ -6,7 +6,7 @@
 - Manufacturer: Leaguer (Shenzhen) Microelectronics Corp (LME)
 - Components:
   - **USB Bridge**: Leaguer MicroElectronics LME2510C
-  - **Demodulator**: Legend Silicon LGS8GL5 or LGS8G75
+  - **Demodulator**: Legend Silicon LGS8GL5
   - **Tuner**: Maxim MAX2165
 
 # Goals
