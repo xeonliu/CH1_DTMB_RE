@@ -23,6 +23,7 @@ import lme2510_init as lme_mod
 from lme2510_init import (
     LME2510,
     DEMOD_ADDR, DEMOD_HIGH, TUNER_ADDR, REF_FREQ, FW_ACK_OK,
+    PID_COLD, PID_WARM,
 )
 
 
@@ -1006,6 +1007,229 @@ class TestConstants(unittest.TestCase):
 
     def test_ref_freq(self):
         self.assertEqual(lme_mod.REF_FREQ, 12)
+
+    def test_pid_cold(self):
+        """Cold-boot PID: device uses 0x1111 before any firmware is loaded (USB controller only)."""
+        self.assertEqual(lme_mod.PID_COLD, 0x1111)
+
+    def test_pid_warm(self):
+        """Warm-boot PID: device uses 0x1120 once the bootloader (stage-1 firmware) is active."""
+        self.assertEqual(lme_mod.PID_WARM, 0x1120)
+
+    def test_pid_is_warm(self):
+        """PID alias must point to PID_WARM."""
+        self.assertEqual(lme_mod.PID, lme_mod.PID_WARM)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 18.  Post-firmware activation command (sub_13EC8)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCmdPostFw(unittest.TestCase):
+    """
+    sub_13EC8 / _cmd_post_fw:
+      Sends [0x8A, 0x00] to EP 0x01 after firmware download.
+      Reads back 5 bytes from EP 0x81 (may fail if device resets immediately).
+      Called as the final step of download_firmware().
+    """
+
+    def test_post_fw_packet_format(self):
+        """CMD 0x8A activation packet must be exactly [0x8A, 0x00]."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x88, 0, 0, 0, 0]))  # 5-byte ACK
+        lme._cmd_post_fw()
+        self.assertEqual(mock.last_write(), bytes([0x8A, 0x00]))
+
+    def test_post_fw_reads_5_bytes(self):
+        """_cmd_post_fw must attempt to read exactly 5 bytes from EP 0x81."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x88, 0, 0, 0, 0]))
+        lme._cmd_post_fw()
+        # After the call, the mock read queue should be empty (5 bytes consumed)
+        self.assertEqual(len(mock._read_queue), 0)
+
+    def test_post_fw_tolerates_usb_error(self):
+        """_cmd_post_fw must not raise even if USB read fails (device may reset)."""
+        import usb.core
+
+        class USBErrorMock(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                raise usb.core.USBError("simulated device reset")
+
+        mock = USBErrorMock()
+        lme = make_lme(mock)
+        # Should not raise
+        try:
+            lme._cmd_post_fw()
+        except Exception as e:
+            self.fail(f"_cmd_post_fw raised unexpectedly: {e}")
+
+    def test_post_fw_tolerates_empty_response(self):
+        """_cmd_post_fw must not raise if the device sends 0 bytes."""
+        mock = MockUsbDevice()
+
+        class EmptyReadMock(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                return b""
+
+        lme = make_lme(EmptyReadMock())
+        try:
+            lme._cmd_post_fw()
+        except Exception as e:
+            self.fail(f"_cmd_post_fw raised on empty response: {e}")
+
+    def test_download_firmware_calls_post_fw(self):
+        """download_firmware() must end with _cmd_post_fw() ([0x8A, 0x00])."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+
+        fw1_path = lme_mod.FW_1_PATH
+        fw2_path = lme_mod.FW_2_PATH
+        if not (os.path.isfile(fw1_path) and os.path.isfile(fw2_path)):
+            self.skipTest("Firmware files not found")
+
+        with open(fw1_path, "rb") as f:
+            blob1 = f.read()
+        with open(fw2_path, "rb") as f:
+            blob2 = f.read()
+
+        # Calculate total chunk count for both firmware stages
+        n1 = (len(blob1) + 49) // 50   # ceil(len/50) for stage 1
+        n2 = (len(blob2) + 49) // 50   # ceil(len/50) for stage 2
+
+        # Queue ACKs for all chunks (each chunk gets 1-byte ACK)
+        for _ in range(n1 + n2):
+            mock.queue_read(bytes([0x88]))
+
+        # Queue the 5-byte response for _cmd_post_fw
+        mock.queue_read(bytes([0x88, 0x00, 0x00, 0x00, 0x00]))
+
+        lme.download_firmware(fw1_path, fw2_path)
+
+        # The very last packet written must be [0x8A, 0x00]
+        self.assertEqual(mock.last_write(), bytes([0x8A, 0x00]),
+                         "Last command after firmware download must be [0x8A, 0x00] (sub_13EC8)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19.  _recv exception handling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRecvExceptionHandling(unittest.TestCase):
+    """
+    _recv() must catch usb.core.USBError and return b"" instead of crashing.
+    This prevents USB timeout errors from propagating as unhandled exceptions.
+    """
+
+    def test_recv_returns_empty_on_usb_error(self):
+        import usb.core
+
+        class USBErrorDev(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                raise usb.core.USBError("simulated timeout")
+
+        lme = make_lme(USBErrorDev())
+        result = lme._recv(5)
+        self.assertEqual(result, b"", "_recv must return b'' on USBError, not raise")
+
+    def test_recv_returns_empty_causes_cmd_read_single_none(self):
+        """When _recv returns b'', cmd_read_single must return None (not crash)."""
+        import usb.core
+
+        class USBErrorDev(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                raise usb.core.USBError("simulated timeout")
+
+        lme = make_lme(USBErrorDev())
+        # _send still works (write succeeds on our mock)
+        result = lme.cmd_read_single(0x32, 0x00)
+        self.assertIsNone(result)
+
+    def test_recv_returns_empty_causes_identify_demod_retry(self):
+        """When USB errors persist, identify_demod must retry and eventually raise RuntimeError."""
+        import usb.core
+
+        class USBErrorDev(MockUsbDevice):
+            def read(self, ep, size, timeout=1000):
+                raise usb.core.USBError("simulated timeout")
+
+        lme = make_lme(USBErrorDev())
+        with self.assertRaises(RuntimeError) as ctx:
+            lme.identify_demod(retries=2, retry_delay=0)
+        self.assertIn("Cannot read Demod reg 0x00", str(ctx.exception))
+
+    def test_recv_normal_path_unaffected(self):
+        """Normal (non-error) reads must still work correctly after exception-handling change."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x55, 0x0E, 0, 0, 0]))
+        result = lme._recv(5)
+        self.assertEqual(result, bytes([0x55, 0x0E, 0, 0, 0]))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 20.  identify_demod retry logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestIdentifyDemodRetry(unittest.TestCase):
+    """
+    identify_demod(retries, retry_delay) must:
+      - Retry up to *retries* times if demod_read(0x00) returns None
+      - Succeed on the first valid response within the retry window
+      - Raise RuntimeError with a clear message if all retries are exhausted
+    """
+
+    def test_succeeds_on_first_attempt(self):
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0x55, 0x0E, 0, 0, 0]))
+        chip = lme.identify_demod(retries=3, retry_delay=0)
+        self.assertEqual(chip, "LGS8GL5")
+
+    def test_succeeds_on_second_attempt(self):
+        """First attempt returns bad prefix → None; second succeeds."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        # First read: wrong prefix → cmd_read_single returns None
+        mock.queue_read(bytes([0xAA, 0x0E, 0, 0, 0]))
+        # Second read: correct
+        mock.queue_read(bytes([0x55, 0x00, 0, 0, 0]))
+        chip = lme.identify_demod(retries=3, retry_delay=0)
+        self.assertEqual(chip, "LGS8G75")
+
+    def test_raises_after_all_retries_exhausted(self):
+        """All retries fail → RuntimeError."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        for _ in range(5):
+            mock.queue_read(bytes([0xAA, 0x00, 0, 0, 0]))  # always wrong prefix
+        with self.assertRaises(RuntimeError) as ctx:
+            lme.identify_demod(retries=3, retry_delay=0)
+        self.assertIn("Cannot read Demod reg 0x00", str(ctx.exception))
+
+    def test_error_message_is_helpful(self):
+        """RuntimeError message must mention firmware."""
+        mock = MockUsbDevice()
+        lme = make_lme(mock)
+        mock.queue_read(bytes([0xAA, 0x00, 0, 0, 0]))
+        try:
+            lme.identify_demod(retries=1, retry_delay=0)
+        except RuntimeError as e:
+            self.assertIn("firmware", str(e).lower())
+
+    def test_default_retries_is_5(self):
+        """Default retries parameter must be 5."""
+        import inspect
+        sig = inspect.signature(LME2510.identify_demod)
+        self.assertEqual(sig.parameters['retries'].default, 5)
+
+    def test_default_retry_delay_is_0_5(self):
+        """Default retry_delay must be 0.5 seconds."""
+        import inspect
+        sig = inspect.signature(LME2510.identify_demod)
+        self.assertEqual(sig.parameters['retry_delay'].default, 0.5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -21,7 +21,10 @@ import argparse
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 VID         = 0x3344   # LME2510C USB Vendor ID
-PID         = 0x1120   # LME2510C USB Product ID (cold-boot / warm-boot share this VID:PID)
+# Device USB Product IDs (from fw_bootloader.bin USB descriptors at offsets 0x00 / 0x100):
+PID_COLD    = 0x1111   # Cold-boot PID — USB controller only, no firmware loaded yet
+PID_WARM    = 0x1120   # Warm-boot PID — after fw_bootloader.bin (stage 1) loads
+PID         = PID_WARM # Default PID used across the codebase
 
 EP_CMD_OUT  = 0x01     # Bulk OUT  64 B  → commands
 EP_CMD_IN   = 0x81     # Bulk IN   64 B  ← command responses / ACK
@@ -70,7 +73,11 @@ class LME2510:
         self.dev.write(EP_CMD_OUT, bytes(data), TIMEOUT_MS)
 
     def _recv(self, n: int) -> bytes:
-        return bytes(self.dev.read(EP_CMD_IN, n, TIMEOUT_MS))
+        try:
+            return bytes(self.dev.read(EP_CMD_IN, n, TIMEOUT_MS))
+        except usb.core.USBError as exc:
+            print(f"  [USB] _recv({n}): {exc}", file=sys.stderr)
+            return b""
 
     # ── Protocol commands ─────────────────────────────────────────────────────
 
@@ -205,17 +212,49 @@ class LME2510:
         time.sleep(0.1)
         self._download_stage(fw2, 2)
         time.sleep(0.5)
+        self._cmd_post_fw()
+
+    def _cmd_post_fw(self):
+        """
+        sub_13EC8: post-firmware activation command.
+
+        Sends [0x8A, 0x00] after both firmware stages are downloaded.
+        This matches driver sub_13EC8 → sub_14046([0x8A, 0x00], 2) which is
+        called as the last step of sub_13A95 (the full firmware-load sequence).
+        After receiving this command the device applies the uploaded firmware
+        and will typically re-enumerate on the USB bus.  USB errors during the
+        5-byte response read are silently ignored because the device may reset
+        before it can reply.
+        """
+        try:
+            self._send([0x8A, 0x00])
+            self._recv(5)   # ACK; may fail if device resets immediately
+        except Exception:
+            pass            # device reset / re-enumeration is expected here
 
     # ── Demodulator identification ────────────────────────────────────────────
 
-    def identify_demod(self) -> str:
+    def identify_demod(self, retries: int = 5, retry_delay: float = 0.5) -> str:
         """
         sub_13AD7: read Demod reg 0x00.
         0x0E → LGS8GL5, else → LGS8G75.
+
+        Retries up to *retries* times (with *retry_delay* seconds between
+        attempts) because the demodulator may not respond immediately after
+        firmware activation or device re-enumeration.
         """
-        val = self.demod_read(0x00)
+        val = None
+        for attempt in range(retries):
+            val = self.demod_read(0x00)
+            if val is not None:
+                break
+            if attempt < retries - 1:
+                time.sleep(retry_delay)
         if val is None:
-            raise RuntimeError("Cannot read Demod reg 0x00")
+            raise RuntimeError(
+                "Cannot read Demod reg 0x00 after retries — "
+                "check USB connection and that firmware is loaded"
+            )
         chip = "LGS8GL5" if val == 0x0E else "LGS8G75"
         print(f"  Demod reg[0x00] = {val:#04x}  →  {chip}")
         return chip
@@ -468,10 +507,16 @@ class LME2510:
 # ─── Device open ──────────────────────────────────────────────────────────────
 
 def open_device() -> usb.core.Device:
-    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    # Try warm-boot PID first (most common); fall back to cold-boot PID
+    dev = usb.core.find(idVendor=VID, idProduct=PID_WARM)
     if dev is None:
-        raise RuntimeError(f"Device {VID:#06x}:{PID:#06x} not found.\n"
-                           "  Windows: run Zadig and switch to WinUSB/libusb-win32.")
+        dev = usb.core.find(idVendor=VID, idProduct=PID_COLD)
+    if dev is None:
+        raise RuntimeError(
+            f"Device not found (VID={VID:#06x}, tried PID={PID_WARM:#06x} and {PID_COLD:#06x}).\n"
+            "  Windows: run Zadig and switch to WinUSB/libusb-win32.\n"
+            "  Linux/macOS: ensure you have permission to access USB devices."
+        )
 
     # Detach kernel driver (Linux / macOS)
     try:
@@ -484,7 +529,7 @@ def open_device() -> usb.core.Device:
     usb.util.claim_interface(dev, 0)
     # Switch to Alt Setting 1 to activate all 7 endpoints
     dev.set_interface_altsetting(interface=0, alternate_setting=1)
-    print(f"Device opened: {VID:#06x}:{PID:#06x}  (Alt Setting 1)")
+    print(f"Device opened: {VID:#06x}:{dev.idProduct:#06x}  (Alt Setting 1)")
     return dev
 
 
@@ -519,6 +564,10 @@ def main():
         time.sleep(2.0)
         dev = open_device()
         lme = LME2510(dev)
+        if not lme.fw_is_loaded():
+            print("Warning: firmware may not be fully active yet "
+                  "(String Descriptor 2 does not contain the 'GGG' warm-boot marker). "
+                  "Continuing anyway — identify_demod() will retry if needed.")
 
     if args.status_only:
         print("\n[EP 0x8A status packets — Ctrl-C to stop]")
