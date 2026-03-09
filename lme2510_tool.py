@@ -6,16 +6,20 @@ import struct
 import os
 
 # Configuration
-VID = 0x3344      # Default LME2510C VID
-PID = 0x1122      # Default LME2510C PID
+VID = 0x3344      # LME2510C USB Vendor ID (confirmed from device descriptor)
+PID = 0x1120      # LME2510C USB Product ID (confirmed from device descriptor; was incorrectly 0x1122)
 EP_OUT = 0x01     # Bulk OUT (Commands)
 EP_IN = 0x81      # Bulk IN (Responses)
-EP_STREAM = 0x82  # Bulk IN (TS Stream)
+EP_STREAM = 0x88  # Bulk IN (TS Stream, High Speed mode; 0x87 isochronous for Full Speed)
 
-# Firmware Files
-FW_BOOTLOADER = "fw_bootloader.bin" # Firmware 1 (Bootloader)
-FW_MAIN = "fw_lgs8g75.bin"          # Firmware 2 (Main)
-# FW_MAIN = "fw_lgs8gl5.bin"        # Alternative
+# Firmware Files (relative to this script's directory)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FW_BOOTLOADER = os.path.join(_SCRIPT_DIR, "fw", "fw_bootloader.bin")   # Firmware 1 (Bootloader)
+FW_MAIN       = os.path.join(_SCRIPT_DIR, "fw", "fw_lgs8g75.bin")      # Firmware 2 (Main, default LGS8G75)
+# FW_MAIN     = os.path.join(_SCRIPT_DIR, "fw", "fw_lgs8gl5.bin")      # Alternative for LGS8GL5
+
+# Valid firmware ACK bytes (driver sub_1392E: both 0x88 and 0x77 signal success)
+FW_ACK_OK = {0x88, 0x77}
 
 class LME2510_Device:
     def __init__(self, dev):
@@ -27,10 +31,14 @@ class LME2510_Device:
             # Detach kernel driver if active (Linux)
             if self.dev.is_kernel_driver_active(0):
                 self.dev.detach_kernel_driver(0)
-        except NotImplementedError:
-            pass # Windows
+        except (NotImplementedError, usb.core.USBError):
+            pass  # Windows or not applicable
 
-        self.dev.set_configuration()
+        self.dev.set_configuration(1)
+        usb.util.claim_interface(self.dev, 0)
+        # Switch to Alternate Setting 1 to activate all 7 endpoints (including EP 0x88, 0x8A)
+        # Alt Setting 0 = 0 endpoints (idle); Alt Setting 1 = 7 endpoints (active)
+        self.dev.set_interface_altsetting(interface=0, alternate_setting=1)
         print(f"Connected to device {hex(self.dev.idVendor)}:{hex(self.dev.idProduct)}")
 
     def send_cmd(self, data, read_len=0):
@@ -108,14 +116,12 @@ class LME2510_Device:
             # Response length is 1 byte
             resp = self.send_cmd(packet, read_len=1)
             
-            # Check response
-            # Linux driver expects 0x88 (-120) or 0x77 (119)?
-            # Actually driver checks: (data[0] == 0x88) ? 0 : -1;
+            # Driver (sub_1392E): both 0x88 (-120 signed) and 0x77 (119) are valid ACK bytes
             if resp:
                 status = resp[0]
-                if status != 0x88:
-                    print(f"Warning at offset {i}: Unexpected status {hex(status)} (Expected 0x88)")
-                    # return False # Driver continues on some errors? But 0x88 is success.
+                if status not in FW_ACK_OK:
+                    print(f"Warning at offset {i}: Unexpected status {hex(status)} (expected 0x88 or 0x77)")
+                    # return False # Driver continues on some errors? But 0x88/0x77 is success.
             else:
                 print(f"Error at offset {i}: No response")
                 return False
@@ -187,34 +193,18 @@ class LME2510_Device:
 
     def read_demod_register(self, dev_addr, reg_addr):
         """
-        Reads a register from Demod/Tuner via Gate 5.
+        Reads a register from Demod/Tuner via CMD 0x85.
         Packet: [85] [02] [DevAddr] [RegAddr] [00]
+        Response: [55] [Value] [xx] [xx] [xx]  — value is at index 1 (sub_14240)
         """
-        # Gate 5 Read
-        # Packet: [0x85, 0x02, DevAddr, RegAddr, 0x00]
-        # 0x85 = Gate 5 | Read
-        # 0x02 = Length?
-        # DevAddr = 0x32
-        # RegAddr = Register to read
-        # 0x00 = ?
-        
         cmd = [0x85, 0x02, dev_addr, reg_addr, 0x00]
         
-        # Read 5 bytes response
-        # Driver says "len = 3" for read_o?
-        # But for Combined Write+Read (Register Read), it's complex.
-        # Let's use the known working packet format from analysis.
+        # Read exactly 5 bytes (CMD 0x85 always returns 5 bytes: [55][value][3 residual])
+        resp = self.send_cmd(cmd, read_len=5)
         
-        resp = self.send_cmd(cmd, read_len=10) # Read more just in case
-        
-        if resp:
-            # print(f"Raw Resp: {list(resp)}")
-            # Expected: [85] [Len] [Data] ...
-            # Usually Data is at index 2 or 3.
-            # Based on previous analysis, data was at index 2?
-            # Let's check for the value.
-            if len(resp) >= 3:
-                return resp[2]
+        if resp and len(resp) >= 2 and resp[0] == 0x55:
+            # Value is at index 1; the 0x55 prefix byte is at index 0 (sub_14240)
+            return resp[1]
         return None
 
     def identify_demod(self):

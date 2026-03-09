@@ -33,12 +33,11 @@ To identify the Demodulator, we use the "Read Register" command (0x85).
 
 **Response Packet (Bulk IN, 5 bytes):**
 ```
-[0x85] [0x02] [Value] [xx] [xx]
+[0x55] [Value] [xx] [xx] [xx]
 ```
-- `0x85`: Echo Command ID
-- `0x02`: Echo Length
-- `Value`: The value read from the register
-- `xx`: Undefined/Padding
+- `0x55`: Fixed prefix byte (always 0x55 for read responses, per sub_14240)
+- `Value`: The value read from the register (at index **1**)
+- `xx`: Residual/undefined bytes (not a checksum, not fixed 0x00)
 
 ## 3. Identification Algorithm
 
@@ -56,7 +55,7 @@ The identification logic is based on reading **Register 0x00** of the Demodulato
 
 3. **Read Response**:
    - Read 5 bytes from Endpoint 0x81.
-   - Extract the 3rd byte (Index 2).
+   - Extract the **2nd byte (Index 1)** — the value at index 0 is the fixed `0x55` prefix.
 
 4. **Determine Version**:
    - If `Value == 0x0E` (14): **LGS8GL5**
@@ -75,8 +74,8 @@ def identify_demod(dev):
     # 3. Read from EP 0x81
     resp = dev.read(0x81, 5)
     
-    # 4. Check Value (Index 2)
-    reg_val = resp[2]
+    # 4. Check Value (Index 1; index 0 is the fixed 0x55 prefix)
+    reg_val = resp[1]
     
     if reg_val == 0x0E:
         return "LGS8GL5"
@@ -88,20 +87,26 @@ def identify_demod(dev):
 
 The LME2510C requires firmware to be downloaded to RAM before it can communicate with the Demodulator.
 
-- **Bootloader**: `fw_bootloader.bin` (Command 0x81)
-- **Main Firmware**: `fw_lgs8g75.bin` or `fw_lgs8gl5.bin` (Command 0x82)
+- **Stage 1 (Bootloader)**: `fw/fw_bootloader.bin` — USB controller patch; sent with command byte `0x01` (last chunk: `0x81`)
+- **Stage 2 (Main)**: `fw/fw_lgs8g75.bin` (default) or `fw/fw_lgs8gl5.bin` — sent with command byte `0x02` (last chunk: `0x82`)
 
-The driver typically defaults to `fw_lgs8g75.bin`. The identification happens *after* firmware download. If the wrong firmware is loaded, basic I2C communication (like reading Register 0x00) should still work, allowing for correction or verification.
+The driver selects Stage 2 firmware based on the chip variant (`word_21042` in the driver). The default is `fw_lgs8g75.bin`. Chip identification happens *after* firmware download, since the I2C bridge is only operational once firmware is running. Basic I2C reads (like Register 0x00) work correctly with either firmware, making post-load identification reliable.
+
+### Firmware ACK Bytes
+Both `0x88` (signed: -120) and `0x77` (signed: 119) are valid ACK bytes from the device during firmware upload (driver `sub_1392E`). A response of any other value indicates an upload failure.
 
 ## 5. Tools
 
-A Python script `lme2510_tool.py` is provided to automate this process using `pyusb`.
+Both `lme2510_tool.py` and `lme2510_init.py` are provided to automate this process using `pyusb`.
 
 **Usage:**
 ```bash
-python lme2510_tool.py
+python lme2510_init.py              # tune to 618 MHz, print status
+python lme2510_init.py --freq 498   # tune to 498 MHz
 ```
 This script will:
-1. Find the LME2510C device.
-2. Download firmware if necessary.
-3. Print the detected Demodulator version.
+1. Find the LME2510C device (VID=0x3344, PID=0x1120).
+2. Download firmware if necessary (checks String Descriptor 2 for "GGG").
+3. Identify the Demodulator chip.
+4. Initialize the MAX2165 tuner.
+5. Tune to the target frequency and poll for lock.

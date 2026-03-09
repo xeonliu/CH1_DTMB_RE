@@ -21,21 +21,27 @@ import argparse
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 VID         = 0x3344   # LME2510C USB Vendor ID
-PID         = 0x1120   # LME2510C USB Product ID
+PID         = 0x1120   # LME2510C USB Product ID (cold-boot / warm-boot share this VID:PID)
 
 EP_CMD_OUT  = 0x01     # Bulk OUT  64 B  → commands
 EP_CMD_IN   = 0x81     # Bulk IN   64 B  ← command responses / ACK
-EP_STREAM   = 0x88     # Bulk IN  512 B  ← MPEG-TS (High Speed mode only)
+EP_STREAM   = 0x88     # Bulk IN  512 B  ← MPEG-TS (High Speed mode only; EP 0x87 for Full Speed)
 EP_STATUS   = 0x8A     # Interrupt IN 64 B ← signal status packets (~128 ms)
 
 DEMOD_ADDR  = 0x32     # LGS8GL5 / LGS8G75 primary I2C address (regs 0x00–0xBF)
-DEMOD_HIGH  = 0x36     # LGS8GL5 / LGS8G75 extended bank (regs 0xC0–0xFF)
+DEMOD_HIGH  = 0x36     # LGS8GL5 / LGS8G75 extended bank (regs 0xC0–0xFF, same chip)
 TUNER_ADDR  = 0xC0     # MAX2165 I2C address
 
 REF_FREQ    = 12       # MAX2165 reference clock (MHz)
 
-FW_1_PATH   = "fw/fw1.bin"   # Firmware stage 1 (bootloader)
-FW_2_PATH   = "fw/fw2.bin"   # Firmware stage 2 (main)
+# Firmware paths relative to this script's directory (extracted from UDE262D.sys)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FW_1_PATH   = os.path.join(_SCRIPT_DIR, "fw", "fw_bootloader.bin")   # Firmware stage 1 (USB controller patch / bootloader)
+FW_2_PATH   = os.path.join(_SCRIPT_DIR, "fw", "fw_lgs8g75.bin")      # Firmware stage 2 (default: LGS8G75; use fw_lgs8gl5.bin for LGS8GL5)
+
+# Valid firmware-download ACK bytes (driver sub_1392E: byte != -120 AND byte != 119 → error)
+# -120 signed == 0x88 unsigned; 119 == 0x77 unsigned
+FW_ACK_OK   = {0x88, 0x77}
 
 TIMEOUT_MS  = 1000
 
@@ -179,7 +185,8 @@ class LME2510:
             pkt = bytes([cmd, len(chunk) - 1]) + chunk + bytes([self._fw_checksum(chunk)])
             self._send(pkt)
             ack = self._recv(1)
-            if not ack or ack[0] != 0x88:
+            # Driver (sub_1392E) accepts both 0x88 (-120 signed) and 0x77 (119) as success
+            if not ack or ack[0] not in FW_ACK_OK:
                 raise RuntimeError(f"FW{fw_id} upload failed at offset {offset}: ack={list(ack)}")
 
         print(f"     → done")
