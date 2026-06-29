@@ -22,16 +22,16 @@ The device has a single interface with **two alternate settings**:
 ### Endpoints (Pipes)
 All endpoints are on Interface 0, Alternate Setting 1. The device exposes **different endpoints in High Speed vs Full Speed** mode:
 
-| Endpoint | Direction | Type | HS Packet | FS Packet | Purpose |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `0x01` | OUT | Bulk | 64 B | 64 B | Command submission |
-| `0x81` | IN | Bulk | 64 B | 64 B | Command response / ACK |
-| `0x02` | OUT | Bulk | 64 B | 64 B | **Unknown** (not seen in driver) |
-| `0x86` | IN | Bulk | 512 B | 64 B | **Unknown** (possibly aux data / debug) |
-| `0x87` | IN | Isochronous | — (absent) | 1020 B, 125 μs | **MPEG-TS stream (Full Speed mode only)** |
-| `0x88` | IN | Bulk | 512 B | — (absent) | **MPEG-TS stream (High Speed mode only)** |
-| `0x0A` | OUT | Bulk | 512 B | 64 B | **Unknown** |
-| `0x8A` | IN | **Interrupt** | 64 B, **128 ms** | 64 B, 127 ms | Signal status / lock state |
+| Endpoint | Direction | Type          | HS Packet        | FS Packet      | Purpose                                   |
+|:---------|:----------|:--------------|:-----------------|:---------------|:------------------------------------------|
+| `0x01`   | OUT       | Bulk          | 64 B             | 64 B           | Command submission                        |
+| `0x81`   | IN        | Bulk          | 64 B             | 64 B           | Command response / ACK                    |
+| `0x02`   | OUT       | Bulk          | 64 B             | 64 B           | **Unknown** (not seen in driver)          |
+| `0x86`   | IN        | Bulk          | 512 B            | 64 B           | **Unknown** (possibly aux data / debug)   |
+| `0x87`   | IN        | Isochronous   | — (absent)       | 1020 B, 125 μs | **MPEG-TS stream (Full Speed mode only)** |
+| `0x88`   | IN        | Bulk          | 512 B            | — (absent)     | **MPEG-TS stream (High Speed mode only)** |
+| `0x0A`   | OUT       | Bulk          | 512 B            | 64 B           | **Unknown**                               |
+| `0x8A`   | IN        | **Interrupt** | 64 B, **128 ms** | 64 B, 127 ms   | Signal status / lock state                |
 
 *Note: `0x87` and `0x88` are mutually exclusive — the device selects the TS output endpoint based on negotiated USB speed.*
 
@@ -114,10 +114,10 @@ The driver identifies the specific Demodulator chip model to apply the correct i
 **Immediately after** identifying the chip, the driver sends CMD `0x16` to tell the USB bridge
 firmware which demodulator type is connected.  This is mandatory for EP `0x8A` status packets:
 
-| Chip | Command bytes |
-| :--- | :--- |
-| LGS8GL5 | `16 01 00` |
-| LGS8G75 | `16 01 01` |
+| Chip    | Command bytes |
+|:--------|:--------------|
+| LGS8GL5 | `16 01 00`    |
+| LGS8G75 | `16 01 01`    |
 
 Without this command the bridge firmware never generates interrupt packets on EP `0x8A`.
 
@@ -139,7 +139,7 @@ demodulator register sequence.
 ### 4.3 Post-Tune Demodulator Register Init
 
 After tuning, the driver configures additional demod registers that prepare the chip for signal
-measurement (sub_14C72(0) + sub_14957(0) + sub_14C16()).  These are needed for valid SNR/BER
+measurement (sub_14C72(0) + sub_14957(0) + sub_14C16()).  These are needed for valid raw status
 values in EP 0x8A packets.
 
 **sub_14C72(0):** Read reg `0x07`; write `0x07 |= 0x0C`; write regs `0x08–0x0B` = `0x00`
@@ -232,36 +232,120 @@ After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals.
 The device asynchronously reports signal quality via EP `0x8A`. Each packet is **8 bytes**.  
 Descriptor interval is ~**128 ms** (interrupt endpoint), while practical reads in script are performed with timeout windows (e.g., 700 ms per read in sample loop).
 
-**Packet Format**:
+**Packet Format (per `lme_parse_ep8a_status_packet`, `0x13708`)**:
 
 ```
-BB 05 [LOCK] [SNR] [BER_H] [CTR] [BER_L] 00
+BB [TYPE] [LOCK] [SIGNAL_LEVEL] [SNR_RAW] [HI] [LO] [RESERVED]
 ```
 
-| Offset | Name | Description |
-| :--- | :--- | :--- |
-| 0 | `0xBB` | Fixed header byte 1 |
-| 1 | `0x05` | Fixed header byte 2 |
-| 2 | `LOCK` | Lock status: `0x01` = locked, `0x00` = not locked |
-| 3 | `SNR` | Signal quality / SNR indicator. `0xFF` = high, `0x00` = low. Noisy without signal. |
-| 4 | `BER_H` | Bit Error Rate (high byte) or carrier status. `0x00` = no error / not acquired. |
-| 5 | `CTR` | Internal AGC/counter: alternates between `0x03` and `0x04`. |
-| 6 | `BER_L` | BER low byte / error indicator. `0xFF` = all bits wrong (no signal), `0x00` = clean. |
-| 7 | Reserved | Always `0x00`. |
+| Offset | Name           | Description                                                                                                         |
+|:-------|:---------------|:--------------------------------------------------------------------------------------------------------------------|
+| 0      | `0xBB`         | Signal/status packet marker. The interrupt completion path dispatches on this byte only.                            |
+| 1      | `TYPE`         | Observed as `0x05` in captures, but the Windows parser does **not** validate it. Treat as packet subtype/unknown.   |
+| 2      | `LOCK`         | Cached as `g_ep8a_lock_flag`. Non-zero is treated as locked by the Windows helper.                                  |
+| 3      | `SIGNAL_LEVEL` | Cached as `g_ep8a_signal_level`. Used by the signal-strength conversion. This is **not** SNR.                       |
+| 4      | `SNR_RAW`      | Cached as `g_ep8a_snr_raw`. Used by the SNR/quality conversion.                                                     |
+| 5      | `HI`           | Cached as `g_ep8a_ber_or_ctr_hi`. For the LGS8GL5 path, this combines with `SIGNAL_LEVEL` for strength calculation. |
+| 6      | `LO`           | Cached as `g_ep8a_ber_or_ctr_lo`. Captured by the parser; no current percent-conversion helper uses it.             |
+| 7      | Reserved       | Observed as `0x00` in captures.                                                                                     |
+
+The current `lme2510_probe.py` is closer to the Windows driver than `lme2510_init.py` because
+`parse_status_packet()` accepts any `0xBB` packet and does not require `TYPE == 0x05`.  However,
+both scripts still use the old field names (`snr = pkt[3]`, `ber_h = pkt[4]`), which do not match
+IDA.  `pkt[3]` is signal level; `pkt[4]` is raw SNR/quality input.
+
+The Windows interrupt completion routine (`lme_interrupt_urb_completion`, `0x12252`) also ignores
+the first four `0xBB` status packets before calling `lme_parse_ep8a_status_packet()`.  A strict
+userspace reproduction should drain or ignore the first four signal-status packets after enabling
+EP `0x8A`.
 
 **Examples from capture (666 MHz, no real signal)**:
 
-| Packet | LOCK | SNR | Interpretation |
-| :--- | :--- | :--- | :--- |
-| `BB 05 01 00 FF 04 FF 00` | 1 | 0x00 | False lock — SNR=0, BER=FF (all errors) |
-| `BB 05 01 FF FF 03 FF 00` | 1 | 0xFF | False lock — SNR noise burst |
-| `BB 05 00 00 00 04 00 00` | 0 | 0x00 | Not locked, no signal |
-| `BB 05 00 FF 00 03 00 00` | 0 | 0xFF | Not locked, AGC sees noise |
+| Packet                    | LOCK | SIGNAL_LEVEL | SNR_RAW | HI   | LO   | Interpretation                      |
+|:--------------------------|:-----|:-------------|:--------|:-----|:-----|:------------------------------------|
+| `BB 05 01 00 FF 04 FF 00` | 1    | 0x00         | 0xFF    | 0x04 | 0xFF | False lock/noise in local captures. |
+| `BB 05 01 FF FF 03 FF 00` | 1    | 0xFF         | 0xFF    | 0x03 | 0xFF | False lock/noise in local captures. |
+| `BB 05 00 00 00 04 00 00` | 0    | 0x00         | 0x00    | 0x04 | 0x00 | Not locked, no signal.              |
+| `BB 05 00 FF 00 03 00 00` | 0    | 0xFF         | 0x00    | 0x03 | 0x00 | Not locked, AGC/noise activity.     |
 
 **Diagnostic rules**:
-- Valid lock: `LOCK=1` AND `SNR` stably high AND `BER_L=0x00`
-- False lock / noise: `LOCK=1` but `SNR` jumps erratically and `BER_L=0xFF`
-- No signal: `LOCK=0`, `SNR` random, `BER_L=0x00`
+- Windows lock helper: `LOCK != 0`.
+- Local false-lock/noise heuristic: `LOCK != 0` while `SIGNAL_LEVEL`, `SNR_RAW`, `HI`, and `LO`
+  show unstable or saturated values across repeated packets.
+- Local no-signal heuristic: `LOCK == 0`, with quality/strength treated as low even if raw bytes
+  fluctuate due to AGC/noise.
+
+### 5.5 Signal Strength and Quality Conversion
+
+The Windows driver converts the cached EP `0x8A` bytes into percent-like values using two helpers:
+
+- `lgs8x_calc_signal_strength_percent` (`0x13D13`)
+- `lgs8x_calc_snr_quality_percent` (`0x13DF2`)
+
+The formulas depend on the demodulator path selected during identification.
+
+**LGS8G75 path**
+
+```c
+strength_base = SIGNAL_LEVEL & 0x07;
+strength = LOCK ? strength_base + 88 : strength_base + 10;
+
+quality_base = SNR_RAW % 12;
+quality = LOCK ? quality_base + 85 : quality_base + 8;
+```
+
+So the G75 path reports narrow bands:
+
+| State    | Strength range | Quality range |
+|:---------|:---------------|:--------------|
+| Unlocked | 10..17         | 8..19         |
+| Locked   | 88..95         | 85..96        |
+
+**LGS8GL5 path**
+
+Signal strength uses `SIGNAL_LEVEL`, `HI`, and `LOCK`:
+
+```c
+strength_low3 = SIGNAL_LEVEL & 0x07;
+strength_word = SIGNAL_LEVEL | (HI << 8);
+
+if (!LOCK)
+    strength = strength_low3 + 8;
+else if ((uint16_t)(strength_word - 0x1F00) <= 0x00FF)
+    strength = strength_low3 + 80;
+else if ((uint16_t)(strength_word - 0x0058) <= 0x00A7)
+    strength = strength_low3 + 70;
+else if ((uint16_t)(strength_word - 0x0100) <= 0x0080)
+    strength = strength_low3 + 60;
+else if (strength_word >= 0x0180 && strength_word <= 0x0200)
+    strength = strength_low3 + 50;
+else
+    strength = 69;
+```
+
+After the locked GL5 strength helper reads `SIGNAL_LEVEL` and `HI`, it clears both cached bytes
+to zero. Userspace code should not assume repeated calls are side-effect-free if trying to mirror
+the Windows driver's cached-state behavior.
+
+SNR/quality uses `SNR_RAW` and `LOCK`:
+
+```c
+quality_mod = SNR_RAW % 15;
+quality_linear = (100 * SNR_RAW) / 255;
+
+if (!LOCK)
+    quality = quality_mod + 5;
+else if (quality_linear == 0)
+    quality = quality_mod + 30;
+else if (quality_linear <= 40)
+    quality = 90 - quality_linear;
+else if (quality_linear < 90)
+    quality = 100 - ((3 * quality_linear / 4) % 100);
+else
+    quality = 30;
+```
+
+The GL5 quality helper clears cached `SNR_RAW` to zero after reading it.
 
 ## 6. Stream Handling
 MPEG-TS data is received via Bulk IN transfers on Pipe 2.
@@ -284,46 +368,47 @@ In `lme2510_init.py`, stream readout is userspace/libusb style:
 ## 7. Key Function Mapping
 
 ### Tuner (MAX2165)
-| Original Function | Description | Note |
-| :--- | :--- | :--- |
-| `sub_13C03` | `Tuner_ApplyFrequency` | Top-level tune flow, input in kHz |
-| `sub_1524A` | `Tuner_SetFrequency` | Core tune: calc + send, input in MHz |
-| `sub_150C4` | `Tuner_CalcDividers` | Calculates N → `byte_2E038`, K → `byte_2E039..3B` |
-| `sub_15114` | `Tuner_CalcControl` | Calculates BW/Gain byte → `byte_2E03C` |
-| `sub_1517F` | `Tuner_CalcRegA` | Calculates reg `0x0A` value → `byte_2E042` |
-| `sub_151B1` | `Tuner_Init` | Full tuner initialization (15-byte config) |
-| `sub_14FFE` | `Tuner_ReadCal` | Reads calibration data from tuner regs |
+| Original Function | Description            | Note                                              |
+|:------------------|:-----------------------|:--------------------------------------------------|
+| `sub_13C03`       | `Tuner_ApplyFrequency` | Top-level tune flow, input in kHz                 |
+| `sub_1524A`       | `Tuner_SetFrequency`   | Core tune: calc + send, input in MHz              |
+| `sub_150C4`       | `Tuner_CalcDividers`   | Calculates N → `byte_2E038`, K → `byte_2E039..3B` |
+| `sub_15114`       | `Tuner_CalcControl`    | Calculates BW/Gain byte → `byte_2E03C`            |
+| `sub_1517F`       | `Tuner_CalcRegA`       | Calculates reg `0x0A` value → `byte_2E042`        |
+| `sub_151B1`       | `Tuner_Init`           | Full tuner initialization (15-byte config)        |
+| `sub_14FFE`       | `Tuner_ReadCal`        | Reads calibration data from tuner regs            |
 
 ### Protocol Commands (LME2510C)
-| Original Function | Description | Note |
-| :--- | :--- | :--- |
-| `sub_14083` | `LME_Cmd04_WriteBlock` | Sends `0x04` command (block I2C write) |
-| `sub_14106` | `LME_Cmd84_ReadBlock` | Sends `0x84` command (block I2C read) |
-| `sub_1417A` | `LME_Cmd05_WriteReg` | Sends `0x05` command (single I2C write) |
-| `sub_14240` | `LME_Cmd85_ReadReg` | Sends `0x85` command (single I2C read) |
-| `sub_14FA2` | `Tuner_WriteRegs` | Wraps `sub_14083` for tuner writes |
-| `sub_14F36` | `Tuner_ReadRegs` | Wraps `sub_14106` for tuner reads |
-| `sub_142BB` | `Demod_RouteAddr` | Maps logical reg addr → I2C device (`0x32` or `0x36`) |
-| `sub_142EA` | `Demod_WriteReg` | Single demod write via logical address (uses `sub_142BB` + `sub_1417A`) |
-| `sub_14350` | `Demod_ReadReg` | Single demod read via logical address (uses `sub_142BB` + `sub_14240`) |
-| `sub_1485E` | `Demod_ReadRegDirect` | Direct demod read via `sub_14240` (device addr explicitly 50=0x32) |
-| `sub_147DA` | `Demod_WriteRegDirect` | Direct demod write via `sub_1417A` (device addr explicitly given) |
-| `sub_13F00` | `LME_CmdSelectChipType` | Sends CMD `0x16` — selects chip type (0=LGS8GL5, 1=LGS8G75); **enables EP 0x8A status** |
-| `sub_13EC8` | `LME_CmdPostFw` | Sends CMD `0x8A 0x00` — activates firmware after download |
+| Original Function | Description             | Note                                                                                    |
+|:------------------|:------------------------|:----------------------------------------------------------------------------------------|
+| `sub_14083`       | `LME_Cmd04_WriteBlock`  | Sends `0x04` command (block I2C write)                                                  |
+| `sub_14106`       | `LME_Cmd84_ReadBlock`   | Sends `0x84` command (block I2C read)                                                   |
+| `sub_1417A`       | `LME_Cmd05_WriteReg`    | Sends `0x05` command (single I2C write)                                                 |
+| `sub_14240`       | `LME_Cmd85_ReadReg`     | Sends `0x85` command (single I2C read)                                                  |
+| `sub_14FA2`       | `Tuner_WriteRegs`       | Wraps `sub_14083` for tuner writes                                                      |
+| `sub_14F36`       | `Tuner_ReadRegs`        | Wraps `sub_14106` for tuner reads                                                       |
+| `sub_142BB`       | `Demod_RouteAddr`       | Maps logical reg addr → I2C device (`0x32` or `0x36`)                                   |
+| `sub_142EA`       | `Demod_WriteReg`        | Single demod write via logical address (uses `sub_142BB` + `sub_1417A`)                 |
+| `sub_14350`       | `Demod_ReadReg`         | Single demod read via logical address (uses `sub_142BB` + `sub_14240`)                  |
+| `sub_1485E`       | `Demod_ReadRegDirect`   | Direct demod read via `sub_14240` (device addr explicitly 50=0x32)                      |
+| `sub_147DA`       | `Demod_WriteRegDirect`  | Direct demod write via `sub_1417A` (device addr explicitly given)                       |
+| `sub_13F00`       | `LME_CmdSelectChipType` | Sends CMD `0x16` — selects chip type (0=LGS8GL5, 1=LGS8G75); **enables EP 0x8A status** |
+| `sub_13EC8`       | `LME_CmdPostFw`         | Sends CMD `0x8A 0x00` — activates firmware after download                               |
 
 ### Demodulator & Stream
-| Original Function | Description | Note |
-| :--- | :--- | :--- |
-| `sub_13AD7` | `Demod_Identify` | Reads reg `0x00`, identifies LGS8GL5 vs LGS8G75; also calls `sub_13F00`, `sub_145A2`, `sub_1440D` |
-| `sub_13F00` | `Demod_SelectChipType` | CMD `0x16` chip-type selector — must follow `Demod_Identify` to enable EP `0x8A` |
-| `sub_145A2` | `Demod_InitRegs_PostIdentify` | Configures demod regs 0x07/0x09–0x0C after identification (LGS8GL5 path) |
-| `sub_1440D` | `Demod_ClearReg07Bits` | Clears bits [7,1,0] of demod reg 0x07 (part of post-identify init) |
-| `sub_14C72` | `Demod_InitSignalMeas` | Sets demod reg 0x07 bits [3:2]; zeros regs 0x08–0x0B (post-tune) |
-| `sub_14957` | `Demod_ClearReg07Bit7` | Clears bit 7 of demod reg 0x07 (post-tune) |
-| `sub_14C16` | `Demod_InitBerRegs` | Sets demod reg 0x0C; zeros reg 0x39; sets reg 0x3D=4 (post-tune) |
-| `sub_13D13` | `Demod_GetSNR` | Returns SNR/quality metric from `byte_2DEE2` |
-| `sub_149DA` | `Demod_AcquireSignal` | LGS8G75 DTMB acquisition loop |
-| `sub_14640` | `Demod_AcquireSignal_GL5` | LGS8GL5 DTMB acquisition loop (called in `sub_13C03`) |
-| `sub_128DC` | `Stream_SubmitUrb` | Allocates and submits Bulk IN URBs to EP `0x88` |
-| `sub_1274F` | `Stream_Callback` | URB completion: copies TS data to KS buffer, re-submits |
-| `sub_1206C` | `Usb_SubmitUrb` | Low-level URB submission |
+| Original Function | Description                   | Note                                                                                              |
+|:------------------|:------------------------------|:--------------------------------------------------------------------------------------------------|
+| `sub_13AD7`       | `Demod_Identify`              | Reads reg `0x00`, identifies LGS8GL5 vs LGS8G75; also calls `sub_13F00`, `sub_145A2`, `sub_1440D` |
+| `sub_13F00`       | `Demod_SelectChipType`        | CMD `0x16` chip-type selector — must follow `Demod_Identify` to enable EP `0x8A`                  |
+| `sub_145A2`       | `Demod_InitRegs_PostIdentify` | Configures demod regs 0x07/0x09–0x0C after identification (LGS8GL5 path)                          |
+| `sub_1440D`       | `Demod_ClearReg07Bits`        | Clears bits [7,1,0] of demod reg 0x07 (part of post-identify init)                                |
+| `sub_14C72`       | `Demod_InitSignalMeas`        | Sets demod reg 0x07 bits [3:2]; zeros regs 0x08–0x0B (post-tune)                                  |
+| `sub_14957`       | `Demod_ClearReg07Bit7`        | Clears bit 7 of demod reg 0x07 (post-tune)                                                        |
+| `sub_14C16`       | `Demod_InitStatusRegs`        | Sets demod reg 0x0C; zeros reg 0x39; sets reg 0x3D=4 (post-tune status/measurement setup)         |
+| `sub_13D13`       | `Demod_GetSignalStrength`     | Converts cached EP `0x8A` `SIGNAL_LEVEL`/`HI` fields into a strength-like percent                 |
+| `sub_13DF2`       | `Demod_GetQuality`            | Converts cached EP `0x8A` `SNR_RAW` field into an SNR/quality-like percent                        |
+| `sub_149DA`       | `Demod_AcquireSignal`         | LGS8G75 DTMB acquisition loop                                                                     |
+| `sub_14640`       | `Demod_AcquireSignal_GL5`     | LGS8GL5 DTMB acquisition loop (called in `sub_13C03`)                                             |
+| `sub_128DC`       | `Stream_SubmitUrb`            | Allocates and submits Bulk IN URBs to EP `0x88`                                                   |
+| `sub_1274F`       | `Stream_Callback`             | URB completion: copies TS data to KS buffer, re-submits                                           |
+| `sub_1206C`       | `Usb_SubmitUrb`               | Low-level URB submission                                                                          |

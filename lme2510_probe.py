@@ -79,6 +79,53 @@ class LME2510:
             print(f"  [USB] _recv({n}): {exc}", file=sys.stderr)
             return b""
 
+    def send_short_cmd(self, data: bytes | list, ack_len: int = 5, label: str = "CMD") -> bytes:
+        pkt = bytes(data)
+        print(f"  {label}: {pkt.hex(' ').upper()}")
+        self._send(pkt)
+        resp = self._recv(ack_len)
+        print(f"    ACK: {resp.hex(' ').upper() if resp else '(none)'}")
+        return resp
+
+    def dump_usb_descriptors(self):
+        print("\n[USB descriptors]")
+        print(f"  VID:PID = {self.dev.idVendor:#06x}:{self.dev.idProduct:#06x}")
+        cfg = self.dev.get_active_configuration()
+        print(f"  active configuration = {cfg.bConfigurationValue}")
+        for intf in cfg:
+            print(f"  interface {intf.bInterfaceNumber}, alt {intf.bAlternateSetting}, "
+                  f"class={intf.bInterfaceClass:#04x}, endpoints={intf.bNumEndpoints}")
+            for ep in intf:
+                attrs = ep.bmAttributes & 0x03
+                typ = {0: "control", 1: "iso", 2: "bulk", 3: "interrupt"}.get(attrs, "?")
+                direction = "IN" if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN else "OUT"
+                print(f"    ep {ep.bEndpointAddress:#04x} {direction:<3} {typ:<9} "
+                      f"maxpkt={ep.wMaxPacketSize} interval={ep.bInterval}")
+
+    def read_ep_raw(self, ep: int, size: int, timeout_ms: int) -> bytes | None:
+        try:
+            data = bytes(self.dev.read(ep, size, timeout_ms))
+            return data
+        except usb.core.USBTimeoutError:
+            return None
+        except usb.core.USBError as exc:
+            print(f"  EP {ep:#04x}: USBError {exc}")
+            return None
+
+    def probe_endpoint(self, ep: int, size: int = 64, count: int = 20,
+                       timeout_ms: int = 500, parse_status: bool = False):
+        print(f"\n[Raw endpoint probe EP {ep:#04x}, size={size}, count={count}, timeout={timeout_ms}ms]")
+        for i in range(count):
+            data = self.read_ep_raw(ep, size, timeout_ms)
+            if data is None:
+                print(f"  {i:02d}: timeout")
+                continue
+            print(f"  {i:02d}: {len(data)} bytes  {data.hex(' ').upper()}")
+            if parse_status:
+                packets = self.parse_status_packets(data, require_type=None)
+                for pkt in packets:
+                    self.print_status(pkt)
+
     # ── Protocol commands ─────────────────────────────────────────────────────
 
     def cmd_write_block(self, dev_addr: int, reg_addr: int, data: list) -> bool:
@@ -307,6 +354,22 @@ class LME2510:
         self._send([0x16, 0x01, chip_type])
         resp = self._recv(5)
         return bool(resp and len(resp) >= 1)
+
+    def cmd_pid_filter_default_1fff(self) -> bool:
+        """
+        Windows path sub_10654(..., a4=0) -> lme_cmd03_pid_filter_program:
+        program one fallback PID 0x1FFF, send the same CMD03 twice, then
+        commit/reset with CMD06 [06 00].
+
+        Built from IDA only. This is useful for checking whether the bridge
+        firmware only starts periodic interrupt/status traffic after the same
+        post-tune PID-filter commit the Windows driver performs.
+        """
+        cmd03 = [0x03, 0x06, 0x00, 0xFF, 0x01, 0x1F, 0x20, 0x81]
+        ack1 = self.send_short_cmd(cmd03, label="CMD03 PID 0x1FFF pass 1")
+        ack2 = self.send_short_cmd(cmd03, label="CMD03 PID 0x1FFF pass 2")
+        ack3 = self.send_short_cmd([0x06, 0x00], label="CMD06 commit")
+        return bool(ack1 and ack2 and ack3)
 
     # ── Post-identify demod init (sub_145A2 + sub_1440D, LGS8GL5 path) ────────
 
@@ -734,19 +797,27 @@ class LME2510:
         return False
 
     @staticmethod
-    def parse_status_packet(raw: bytes) -> dict | None:
+    def parse_status_packets(raw: bytes, require_type: int | None = 0x05) -> list[dict]:
+        packets = []
         for offset in range(0, max(0, len(raw) - 7), 8):
             pkt = raw[offset:offset + 8]
-            if len(pkt) >= 8 and pkt[0] == 0xBB and pkt[1] == 0x05:
-                return {
+            if len(pkt) >= 8 and pkt[0] == 0xBB and (require_type is None or pkt[1] == require_type):
+                packets.append({
+                    'type':  pkt[1],
                     'lock':  pkt[2],
                     'snr':   pkt[3],
                     'ber_h': pkt[4],
                     'ctr':   pkt[5],
                     'ber_l': pkt[6],
                     'raw':   pkt[:8].hex(' ').upper(),
-                }
-        return None
+                    'offset': offset,
+                })
+        return packets
+
+    @staticmethod
+    def parse_status_packet(raw: bytes) -> dict | None:
+        packets = LME2510.parse_status_packets(raw, require_type=None)
+        return packets[0] if packets else None
 
     def read_status_packet(self, timeout_ms: int = 700) -> dict | None:
         """
@@ -779,7 +850,7 @@ class LME2510:
             print("  EP 0x8A: (status endpoint no packet)")
             return
         print(f"  EP 0x8A: [{s['raw']}]  "
-              f"lock={s['lock']}  SNR={s['snr']:#04x}  "
+              f"type={s.get('type', 0):#04x}  lock={s['lock']}  SNR={s['snr']:#04x}  "
               f"BER={s['ber_h']:02X}{s['ber_l']:02X}  "
               f"→ {self.interpret_status(s)}")
 
@@ -826,7 +897,7 @@ def open_device() -> usb.core.Device:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LME2510C DTMB USB initialization & tuning tool")
+        description="Experimental LME2510C DTMB USB probing tool")
     parser.add_argument("--freq",   type=int,   default=618,
                         help="Tune frequency in MHz (default: 618)")
     parser.add_argument("--stream", action="store_true",
@@ -839,6 +910,22 @@ def main():
                         help="Only print EP 0x8A status packets, no tuning")
     parser.add_argument("--diag-demod", action="store_true",
                         help="Read demod ID and key registers, then exit")
+    parser.add_argument("--dump-usb", action="store_true",
+                        help="Print active USB configuration/endpoints")
+    parser.add_argument("--probe-status", action="store_true",
+                        help="Raw-read EP 0x8A after optional tune/commands")
+    parser.add_argument("--probe-stream", action="store_true",
+                        help="Raw-read EP 0x88 after optional tune/commands")
+    parser.add_argument("--probe-count", type=int, default=20,
+                        help="Raw probe transfer count (default: 20)")
+    parser.add_argument("--probe-timeout", type=int, default=500,
+                        help="Raw probe timeout in ms (default: 500)")
+    parser.add_argument("--probe-size", type=int, default=64,
+                        help="Raw status probe size in bytes (default: 64)")
+    parser.add_argument("--no-tune", action="store_true",
+                        help="Skip identify/tuner/tune; useful for endpoint-only probing")
+    parser.add_argument("--pid-filter-default", action="store_true",
+                        help="After tune, send Windows-derived CMD03 PID 0x1FFF twice plus CMD06 commit")
     args = parser.parse_args()
 
     # ── 1. Open device ────────────────────────────────────────────────────────
@@ -860,6 +947,9 @@ def main():
                   "(String Descriptor 2 does not contain the 'GGG' warm-boot marker). "
                   "Continuing anyway — identify_demod() will retry if needed.")
 
+    if args.dump_usb:
+        lme.dump_usb_descriptors()
+
     if args.status_only:
         print("\n[EP 0x8A status packets — Ctrl-C to stop]")
         while True:
@@ -868,6 +958,15 @@ def main():
 
     if args.diag_demod:
         lme.diag_demod()
+        return
+
+    if args.no_tune:
+        if args.probe_status:
+            lme.probe_endpoint(EP_STATUS, size=args.probe_size, count=args.probe_count,
+                               timeout_ms=args.probe_timeout, parse_status=True)
+        if args.probe_stream:
+            lme.probe_endpoint(EP_STREAM, size=4096, count=args.probe_count,
+                               timeout_ms=args.probe_timeout)
         return
 
     # ── 3. Identify demodulator ───────────────────────────────────────────────
@@ -897,6 +996,18 @@ def main():
 
     # ── 5a/6. Chip-specific post-tune lock path ──────────────────────────────
     locked = lme.lock_after_tune(chip)
+
+    if args.pid_filter_default:
+        print("\n[Windows-derived default PID-filter commit]")
+        lme.cmd_pid_filter_default_1fff()
+
+    if args.probe_status:
+        lme.probe_endpoint(EP_STATUS, size=args.probe_size, count=args.probe_count,
+                           timeout_ms=args.probe_timeout, parse_status=True)
+
+    if args.probe_stream:
+        lme.probe_endpoint(EP_STREAM, size=4096, count=args.probe_count,
+                           timeout_ms=args.probe_timeout)
 
     # ── 7. Signal status via EP 0x8A ─────────────────────────────────────────
     print("\n[EP 0x8A signal status (5 packets)]")
