@@ -2,6 +2,8 @@
 
 > TODO: Image Here
 
+C++编译二进制版本下载及使用说明：[CH1_DTMB_RE_cpp](https://github.com/xeonliu/CH1_DTMB_RE_cpp)
+
 - Product Name: `CH1 (第一波道) USB2.0 PCTV Receiver`
 - Manufacturer: Leaguer (Shenzhen) Microelectronics Corp (LME)
 - Components:
