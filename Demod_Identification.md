@@ -47,7 +47,8 @@ The identification logic is based on reading **Register 0x00** of the Demodulato
 
 1. **Ensure Firmware is Loaded**: 
    - The device must be in a "Warm" state (Firmware loaded).
-   - Check USB String Descriptor 2. If it contains "GGG", firmware is loaded.
+   - Check USB String Descriptor 2. If the raw payload contains `GGGG`, main
+     firmware is loaded (see the marker note below).
    - If not, download `fw_bootloader.bin` and `fw_lgs8g75.bin` first.
 
 2. **Send Read Command**:
@@ -94,6 +95,18 @@ The driver selects Stage 2 firmware based on the chip variant (`word_21042` in t
 
 ### Firmware ACK Bytes
 Both `0x88` (signed: -120) and `0x77` (signed: 119) are valid ACK bytes from the device during firmware upload (driver `sub_1392E`). A response of any other value indicates an upload failure.
+
+### Main-firmware marker note
+
+String descriptor 2 is not valid UTF-16LE; it contains raw ASCII bytes:
+
+- before main firmware: `DEFG`
+- after main firmware: `GGGG`
+
+Decoding it with `usb.util.get_string()` produces CJK-looking garbage, so
+check the raw descriptor payload for three or more `0x47` bytes
+(`read_string_descriptor_raw()` / `firmware_marker_ok()` in
+`lme2510_init.py` and `lme2510_probe.py`).
 
 ## 5. Tools
 

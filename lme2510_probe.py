@@ -1,11 +1,11 @@
 """
-lme2510_init.py — LME2510C DTMB USB stick initialization tool
+lme2510_probe.py — experimental LME2510C DTMB USB probing tool
 Based on reverse engineering of UDE262D.sys (IDA Pro 9.0)
 
 Usage:
-    python lme2510_init.py              # tune to 618 MHz, print status
-    python lme2510_init.py --freq 498   # tune to 498 MHz
-    python lme2510_init.py --freq 618 --stream  # dump raw TS to stdout
+    python lme2510_probe.py              # tune to 618 MHz, print status
+    python lme2510_probe.py --freq 554   # tune to 554 MHz
+    python lme2510_probe.py --freq 618 --stream  # dump raw TS to stdout
 
 Requires: pyusb  (pip install pyusb)
 Windows:  also install Zadig and switch the device to WinUSB/libusb driver
@@ -47,6 +47,42 @@ FW_2_PATH   = os.path.join(_SCRIPT_DIR, "fw", "fw_lgs8g75.bin")      # Firmware 
 FW_ACK_OK   = {0x88, 0x77}
 
 TIMEOUT_MS  = 1000
+
+
+# ─── USB string helpers ───────────────────────────────────────────────────────
+
+def read_string_descriptor_raw(dev, index: int, langid: int = 0x0409) -> bytes:
+    """
+    Read a USB string descriptor as raw bytes (no UTF-16 decoding).
+
+    The LME2510C's firmware puts an ASCII marker in string descriptor 2
+    without proper UTF-16LE encoding, so pyusb's get_string() mangles it
+    (\"GGGG\" becomes CJK-looking garbage).  Read raw descriptor bytes and
+    inspect the payload instead.
+    """
+    try:
+        raw = bytes(dev.ctrl_transfer(
+            bmRequestType=0x80, bRequest=0x06,
+            wValue=(0x03 << 8) | index, wIndex=langid,
+            data_or_wLength=255, timeout=1000,
+        ))
+    except Exception:
+        return b""
+    # Descriptor: [len][type=0x03][UTF-16LE-ish payload...]
+    return raw[2:]
+
+
+def firmware_marker_ok(payload: bytes, min_g: int = 3) -> bool:
+    """
+    Stage-2 (main) firmware marks string descriptor 2 with 0x47 ('G') bytes:
+
+      bootloader / stage-1 only: DEFG  -> one 'G'
+      main firmware active:      GGGG  -> four 'G's
+
+    Accept the descriptor only when at least *min_g* ASCII 'G' bytes are
+    present so a plain bootloader can never be mistaken for a loaded device.
+    """
+    return payload.count(0x47) >= min_g
 
 
 # ─── LME2510 device class ─────────────────────────────────────────────────────
@@ -246,12 +282,8 @@ class LME2510:
         print(f"     → done")
 
     def fw_is_loaded(self) -> bool:
-        """Check String Descriptor index 2 for 'GGG' (post-FW marker)."""
-        try:
-            s = usb.util.get_string(self.dev, 2)
-            return "GGG" in s
-        except Exception:
-            return False
+        """Check raw String Descriptor 2 bytes for the 'GGGG' post-FW marker."""
+        return firmware_marker_ok(read_string_descriptor_raw(self.dev, 2))
 
     def download_firmware(self, fw1: str = FW_1_PATH, fw2: str = FW_2_PATH):
         print("Firmware download:")
@@ -809,6 +841,11 @@ class LME2510:
                     'ber_h': pkt[4],
                     'ctr':   pkt[5],
                     'ber_l': pkt[6],
+                    # Documented driver field names (see LME2510_Analysis.md):
+                    'signal_level': pkt[3],
+                    'snr_raw':      pkt[4],
+                    'hi':           pkt[5],
+                    'lo':           pkt[6],
                     'raw':   pkt[:8].hex(' ').upper(),
                     'offset': offset,
                 })
@@ -834,7 +871,14 @@ class LME2510:
         except usb.core.USBTimeoutError:
             pass
         except Exception as e:
-            print(f"  EP 0x8A error: {e}")
+            # After a long uninterrupted TS run the firmware may have queued
+            # many 8-byte packets; a 64-byte read then overflows.  Drain a
+            # larger transfer and parse the first status packet from it.
+            try:
+                raw = bytes(self.dev.read(EP_STATUS, 512, timeout_ms))
+                return self.parse_status_packet(raw)
+            except Exception:
+                print(f"  EP 0x8A error: {e}")
         return None
 
     @staticmethod
@@ -850,9 +894,10 @@ class LME2510:
             print("  EP 0x8A: (status endpoint no packet)")
             return
         print(f"  EP 0x8A: [{s['raw']}]  "
-              f"type={s.get('type', 0):#04x}  lock={s['lock']}  SNR={s['snr']:#04x}  "
-              f"BER={s['ber_h']:02X}{s['ber_l']:02X}  "
-              f"→ {self.interpret_status(s)}")
+              f"type={s.get('type', 0):#04x}  lock={s['lock']}  "
+              f"signal={s['signal_level']:#04x}  snr_raw={s['snr_raw']:#04x}  "
+              f"hi={s['hi']:02X}  lo={s['lo']:02X}  "
+              f"→ {'LOCKED ✓' if s['lock'] else 'not locked'}")
 
     # ── TS stream ─────────────────────────────────────────────────────────────
 
@@ -924,8 +969,10 @@ def main():
                         help="Raw status probe size in bytes (default: 64)")
     parser.add_argument("--no-tune", action="store_true",
                         help="Skip identify/tuner/tune; useful for endpoint-only probing")
-    parser.add_argument("--pid-filter-default", action="store_true",
-                        help="After tune, send Windows-derived CMD03 PID 0x1FFF twice plus CMD06 commit")
+    parser.add_argument("--no-pid-filter", action="store_true",
+                        help="Skip the post-tune PID 0x1FFF filter commit. "
+                             "Without the commit the bridge never emits EP 0x8A "
+                             "status packets or EP 0x88 TS data.")
     args = parser.parse_args()
 
     # ── 1. Open device ────────────────────────────────────────────────────────
@@ -997,7 +1044,7 @@ def main():
     # ── 5a/6. Chip-specific post-tune lock path ──────────────────────────────
     locked = lme.lock_after_tune(chip)
 
-    if args.pid_filter_default:
+    if not args.no_pid_filter:
         print("\n[Windows-derived default PID-filter commit]")
         lme.cmd_pid_filter_default_1fff()
 

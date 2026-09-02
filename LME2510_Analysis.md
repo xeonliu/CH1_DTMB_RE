@@ -35,6 +35,10 @@ All endpoints are on Interface 0, Alternate Setting 1. The device exposes **diff
 
 *Note: `0x87` and `0x88` are mutually exclusive — the device selects the TS output endpoint based on negotiated USB speed.*
 
+*Note:* EP `0x8A` and EP `0x88` stay silent until the post-tune PID-filter
+commit runs (CMD `0x03` ×2 then CMD `0x06`; see Common Commands below).  This
+is the last step of the enable chain described in Section 6.
+
 ### Command Structure
 Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x81`).
 
@@ -44,6 +48,19 @@ Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x8
 
 #### Common Commands
 - **0x01 / 0x02**: Firmware Download (Chunked).
+- **0x03**: PID-Filter Program. Function: `sub_13F76` (sends via `sub_14046`).
+  - Builds a payload of `count` PID entries (1..16), one `0x20` byte, and one
+    terminal byte:
+    `[03] [4n+2] [2k] [pid_lo] [2k+1] [pid_hi] ... [20] [terminal]`
+    where `n = count`, byte 1 is the payload length after the length field, and
+    each PID entry is 4 bytes with `k` = PID index.
+  - Terminal byte: `0x80 + 2*(count-1)` when `mode=0`; `0x81 + 2*(count-1)`
+    when `mode=2` (observed `0x81` at `count=1`).
+  - If `count > 0`, the whole packet is sent **twice**, then the driver calls
+    `sub_13E90` (CMD `0x06`) to commit the filter.
+  - Observed default — one fallback PID `0x1FFF`, `count=1`, `mode=2`:
+    `03 06 00 FF 01 1F 20 81` (trailer `0x81`), sent twice.
+  - ACK: `0x88`.
 - **0x04**: Block Write (I2C multi-byte write). Function: `sub_14083`.
   - Format: `[04] [Len] [DevAddr] [RegAddr] [Data...]`
   - `Len` = number of bytes after `[Len]` field = `1 + 1 + data_count` (DevAddr + RegAddr + data)
@@ -51,6 +68,9 @@ Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x8
 - **0x05**: Single Register Write. Function: `sub_1417A`.
   - Format: `[05] [04] [DevAddr] [RegAddr] [Value]`
   - `Len` is always `0x04` (= 1 DevAddr + 1 RegAddr + 1 Value + 1)
+- **0x06**: PID-Filter Commit / Reset. Function: `sub_13E90` → `sub_14046`.
+  - Bytes: `06 00`.
+  - ACK: `0x88`.
 - **0x16**: Chip-Type Selection. Function: `sub_13F00`.
   - Format: `[16] [01] [chip_type]`  (3 bytes total)
   - `chip_type = 0x00` for LGS8GL5; `chip_type = 0x01` for LGS8G75
@@ -91,12 +111,27 @@ The driver checks if the firmware is loaded (Cold Boot). If not, it performs a 2
 
 **Stages** (`sub_13A95`):
 1. **Firmware 1**: Likely the USB controller patch or bootloader.
-2. **Firmware 2**: Tuner/Demodulator initialization script.
+2. **Firmware 2**: Tuner/Demodulator initialization script.  The driver selects
+   the stage-2 blob by USB PID low byte: `0xD0` → 3143-byte blob (`unk_22420`);
+   any other PID (including our `0x1120`) → 4836-byte blob (`unk_21138`).
 
 **Post-download activation** (`sub_13EC8`):
 - Driver/script sends `8A 00` after both stages.
 - Device may immediately reset/re-enumerate, so response read may fail transiently.
-- `lme2510_init.py` then waits 2 seconds, re-opens USB, and checks String Descriptor index 2 for warm marker `"GGG"`.
+- `lme2510_init.py` then waits 2 seconds, re-opens USB, and checks String
+  Descriptor index 2 for the warm marker.
+
+**Warm marker format:** string descriptor 2 contains raw ASCII bytes:
+
+| state          | string descriptor 2 payload |
+|:---------------|:----------------------------|
+| stage-1 only   | `DEFG` (one `G`)            |
+| stage-2 loaded | `GGGG`                      |
+
+pyusb's `get_string()` decodes the descriptor as UTF-16LE and mangles it into
+CJK-like code points, so checks such as `"GGG" in s` never match.  Tools read
+the raw descriptor with `ctrl_transfer(... GET_DESCRIPTOR string)` and count
+`0x47` bytes instead.
 
 ## 4. Demodulator Identification
 The driver identifies the specific Demodulator chip model to apply the correct initialization sequence.
@@ -163,6 +198,23 @@ Before normal tuning, script performs a dedicated init block write:
 - Builds and writes a **15-byte** init table to tuner starting at reg `0x00` (base frequency 474 MHz).
 - Tuner access is always wrapped by repeater open/close (`Demod reg 0x01 = 0xE0` / `0x60`).
 
+**MAX2165 register-access notes:**
+- The MAX2165 does not auto-increment across block reads through this bridge:
+  CMD `0x84` reads only the addressed byte and fills the rest with `0xFF`, so
+  diagnostics must read each register individually.
+- Always run this calibration-based init before tuning.  Re-tuning without it
+  clobbers tuner reg `0x0A` to `0x03` and kills real reception (`reg0A`'s high
+  nibble comes from the ROM calibration table).
+
+Observed MAX2165 `0x11` (STATUS) bits (locked DTMB signal):
+
+| bit | meaning                      | observed                              |
+|:----|:-----------------------------|:--------------------------------------|
+| 6   | VCO auto success             | 1                                     |
+| 5   | VCO auto active              | 1                                     |
+| 4   | PLL locked                   | 1                                     |
+| 0   | signal level over threshold  | often 0 even with a locked DTMB signal |
+
 ### 5.1 Frequency Calculation (MAX2165)
 Base Reference Frequency (RefFreq) is **12 MHz**.
 
@@ -226,6 +278,12 @@ After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals.
   - `0x01`: Demod locked / locked bit set
   - `0x02`: Not yet locked
   - `0x81`: AGC/signal detected but not data-locked
+
+*Example locked telemetry snapshot (554 MHz, `lme2510_stream.py --reg-log`):*
+
+```
+TELEMETRY | 4B=0xC4 A4=0x05 37=0x01 7C=0x07 A2=0x6A tuner11=0x72 tuner12=0x72
+```
 
 ### 5.4 Signal Status Packet (EP `0x8A`)
 
@@ -350,6 +408,24 @@ The GL5 quality helper clears cached `SNR_RAW` to zero after reading it.
 ## 6. Stream Handling
 MPEG-TS data is received via Bulk IN transfers on Pipe 2.
 
+**Enable prerequisite:** the bridge only starts emitting EP `0x8A`
+signal-status packets and EP `0x88` MPEG-TS after the Windows driver's
+post-tune PID-filter commit
+(`sub_13F76(..., pid=0x1FFF, count=1, mode=2)` followed by `sub_13E90`):
+
+```
+03 06 00 FF 01 1F 20 81     (send twice)
+06 00
+```
+
+Both commands ACK with `0x88`.  Order matters:
+
+1. firmware load + identify (`0x0E` → LGS8GL5)
+2. CMD `0x16` chip-type selection
+3. tuner init, tune, LGS8GL5 lock training
+4. **PID-filter commit**
+5. EP `0x8A` status packets (~128 ms) and EP `0x88` TS now flow
+
 **Function**: `sub_128DC` (Submit Stream IRP)
 - Allocates URBs (USB Request Blocks).
 - Submits Bulk IN requests to Pipe 2.
@@ -361,9 +437,25 @@ MPEG-TS data is received via Bulk IN transfers on Pipe 2.
 - Advances the KS stream pointer to notify the graph (e.g., Media Player).
 - Re-submits the URB to continue streaming.
 
-In `lme2510_init.py`, stream readout is userspace/libusb style:
-- Reads EP `0x88` in chunks (`buf_size=4096`, timeout `500 ms`).
-- On `--stream`, writes raw bytes directly to `stdout` continuously.
+**EP 0x88 stream structure.** EP 0x88 delivers one continuous MPEG-TS byte
+stream.  Bulk IN reads return successive slices of this byte stream; a
+188-byte TS packet may begin in one read and finish in the next, so a read
+boundary is not guaranteed to coincide with a TS packet boundary.
+
+Recovery procedure:
+
+1. Append each read to the byte buffer.
+2. When the buffer begins with `0x47` and contains at least 188 bytes, emit
+   that packet and remove its 188 bytes.
+3. Keep a trailing partial packet in the buffer for the next read.
+4. Re-synchronize only after the first buffered byte is not `0x47`.
+
+While EP `0x88` is active, the host must keep submitting reads.  The userspace
+read loop therefore performs no synchronous status/I2C I/O while streaming;
+those operations are deferred until the loop idles or stops.
+
+Observed locked throughput on 554 MHz: 16.90 Mbit/s of TS payload, with zero
+USB read timeouts.
 
 ## 7. Key Function Mapping
 
@@ -394,6 +486,8 @@ In `lme2510_init.py`, stream readout is userspace/libusb style:
 | `sub_147DA`       | `Demod_WriteRegDirect`  | Direct demod write via `sub_1417A` (device addr explicitly given)                       |
 | `sub_13F00`       | `LME_CmdSelectChipType` | Sends CMD `0x16` — selects chip type (0=LGS8GL5, 1=LGS8G75); **enables EP 0x8A status** |
 | `sub_13EC8`       | `LME_CmdPostFw`         | Sends CMD `0x8A 0x00` — activates firmware after download                               |
+| `sub_13F76`       | PID-filter program (CMD `0x03`) | Builds PID list, sends twice, then calls `sub_13E90`; enables EP 0x8A/0x88 traffic |
+| `sub_13E90`       | PID-filter commit/reset (CMD `0x06`) | Sends `06 00`                                                                   |
 
 ### Demodulator & Stream
 | Original Function | Description                   | Note                                                                                              |

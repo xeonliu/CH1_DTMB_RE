@@ -26,3 +26,20 @@
 - [Linux Kernel Driver for LME2510C](https://github.com/torvalds/linux/blob/master/drivers/media/usb/dvb-usb-v2/lmedm04.c)
 - [LeDTMB](https://github.com/IcingTomato/LeDTMB): Client for a rather simple DTMB receiver.
 - [libusb](https://libusb.info/): Library for USB device access in userspace.
+
+# Usage
+
+`lme2510_stream.py` tunes a CH1 stick, enables the transport stream, and
+forwards MPEG-TS to UDP and/or a `.ts` file while logging register/status
+operations.  EP 0x88 is read as one continuous byte stream and re-assembled
+into 188-byte MPEG-TS packets before forwarding.
+
+```
+sudo .venv/bin/python lme2510_stream.py --freq 618
+sudo .venv/bin/python lme2510_stream.py --freq 554 --no-udp \
+    --file ts554.ts --seconds 10 \
+    --reg-log logs/regs-554.log --status-log logs/stream-554.log
+```
+
+`lme2510_init.py` and `lme2510_probe.py` expose the same protocol sequence for
+endpoint/register research.  See `LME2510_Analysis.md` section 6.
