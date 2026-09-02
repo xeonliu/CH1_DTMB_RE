@@ -58,8 +58,23 @@ Commands are sent to Pipe 1 (EP `0x01`). Responses are read from Pipe 0 (EP `0x8
     when `mode=2` (observed `0x81` at `count=1`).
   - If `count > 0`, the whole packet is sent **twice**, then the driver calls
     `sub_13E90` (CMD `0x06`) to commit the filter.
-  - Observed default — one fallback PID `0x1FFF`, `count=1`, `mode=2`:
-    `03 06 00 FF 01 1F 20 81` (trailer `0x81`), sent twice.
+  - **Mode semantics on EP `0x88` (LGS8GL5 + MAX2165):**
+    - `mode=0` = allow-list — only the listed PIDs are forwarded.  Observed:
+      single PID `0x0203` (`03 06 00 03 01 02 20 80`) → only `0x0203`;
+      two PIDs (`03 0A 00 00 01 02 02 01 03 02 20 82`) → only `0x0200`/`0x0201`.
+    - `mode=2` + PID `0x1FFF` = clear/reset — full TS passes
+      (`03 06 00 FF 01 1F 20 81`; Windows post-tune default).
+    - `mode=2` + real PID list = **drop/block-list** on the tested device (not
+      an allow-list).  Each listed PID is removed from EP `0x88`, every
+      non-listed PID still flows, and `0x1FFF` null packets are inserted to
+      fill the freed bandwidth:
+      - one PID `0x0203`: `03 06 00 03 01 02 20 81` → `0x0203` absent, other
+        PIDs present, ~12% `0x1FFF` nulls;
+      - two PIDs `0x0200`/`0x0201`:
+        `03 0A 00 00 01 02 02 01 03 02 20 83` → both absent, other PIDs
+        present, `0x1FFF` padding.
+      - `0x1FFF` itself is special here: it is not treated as a PID to drop
+        but resets the table to the all-pass form above.
   - ACK: `0x88`.
 - **0x04**: Block Write (I2C multi-byte write). Function: `sub_14083`.
   - Format: `[04] [Len] [DevAddr] [RegAddr] [Data...]`
@@ -426,6 +441,12 @@ Both commands ACK with `0x88`.  Order matters:
 4. **PID-filter commit**
 5. EP `0x8A` status packets (~128 ms) and EP `0x88` TS now flow
 
+For per-PID forwarding, the CMD `0x03` in the commit must use `mode=0`
+(allow-list).  The `0x1FFF`/`mode=2` form shown above is the clear/reset
+"all PIDs" commit.  Do not use `mode=2` with real PIDs for forwarding — on
+the tested device that is a drop/block-list (listed PIDs removed, all others
+still flow, with `0x1FFF` padding), not an allow-list (see CMD `0x03`).
+
 **Function**: `sub_128DC` (Submit Stream IRP)
 - Allocates URBs (USB Request Blocks).
 - Submits Bulk IN requests to Pipe 2.
@@ -486,8 +507,8 @@ USB read timeouts.
 | `sub_147DA`       | `Demod_WriteRegDirect`  | Direct demod write via `sub_1417A` (device addr explicitly given)                       |
 | `sub_13F00`       | `LME_CmdSelectChipType` | Sends CMD `0x16` — selects chip type (0=LGS8GL5, 1=LGS8G75); **enables EP 0x8A status** |
 | `sub_13EC8`       | `LME_CmdPostFw`         | Sends CMD `0x8A 0x00` — activates firmware after download                               |
-| `sub_13F76`       | PID-filter program (CMD `0x03`) | Builds PID list, sends twice, then calls `sub_13E90`; enables EP 0x8A/0x88 traffic |
-| `sub_13E90`       | PID-filter commit/reset (CMD `0x06`) | Sends `06 00`                                                                   |
+| `sub_13F76`       | PID-filter program (CMD `0x03`) | Builds PID list (mode 0 = allow-list; mode 2 + `0x1FFF` = clear/all-pass; mode 2 + real PIDs = drop/block-list as observed), sends twice, then calls `sub_13E90`; enables EP 0x8A/0x88 traffic |
+| `sub_13E90`       | PID-filter commit/reset (CMD `0x06`) | Sends `06 00`                                                                    |
 
 ### Demodulator & Stream
 | Original Function | Description                   | Note                                                                                              |

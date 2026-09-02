@@ -378,6 +378,13 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--freq", type=int, default=618, help="tune frequency in MHz")
+    ap.add_argument("--pids", default="",
+                    help="comma-separated PID list (hex, e.g. 0x0100,0x0101) to "
+                         "program into the bridge filter as an allow-list; "
+                         "default 0x1FFF = all PIDs")
+    ap.add_argument("--pid-mode", type=int, default=0,
+                    help="CMD 0x03 mode for --pids: 0 = keep only listed PIDs "
+                         "(default); 2 = clear/0x1FFF semantics (advanced)")
     ap.add_argument("--udp", default="127.0.0.1:1234",
                     help="UDP target host:port (default 127.0.0.1:1234)")
     ap.add_argument("--raw-udp", default="",
@@ -417,7 +424,12 @@ def main():
         lme._init_demod_after_identify(chip)
         lme.tune(args.freq)
         locked = lme.lock_after_tune(chip)
-        lme.cmd_pid_filter_default_1fff()
+        pid_list = [int(p.strip(), 0) for p in args.pids.split(",") if p.strip()]
+        if pid_list:
+            print(f"\nPID filter: {', '.join(f'0x{p:04X}' for p in pid_list)}")
+            lme.cmd_pid_filter(pid_list, mode=args.pid_mode)
+        else:
+            lme.cmd_pid_filter_default_1fff()
         # The PID-filter commit (CMD 0x03 x2 + CMD 0x06) is what makes the
         # bridge start emitting EP 0x8A status packets, so sample right after
         # it — still before forwarding begins.

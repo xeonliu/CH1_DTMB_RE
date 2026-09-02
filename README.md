@@ -39,6 +39,10 @@ sudo .venv/bin/python lme2510_stream.py --freq 618
 sudo .venv/bin/python lme2510_stream.py --freq 554 --no-udp \
     --file ts554.ts --seconds 10 \
     --reg-log logs/regs-554.log --status-log logs/stream-554.log
+
+# forward only selected PIDs (CMD 0x03 allow-list / mode 0)
+sudo .venv/bin/python lme2510_stream.py --freq 618 --no-udp \
+    --pids 0x0200,0x0201 --file ts2pids.ts --seconds 10
 ```
 
 `lme2510_init.py` and `lme2510_probe.py` expose the same protocol sequence for

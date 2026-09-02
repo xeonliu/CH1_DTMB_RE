@@ -397,9 +397,38 @@ class LME2510:
         firmware only starts periodic interrupt/status traffic after the same
         post-tune PID-filter commit the Windows driver performs.
         """
-        cmd03 = [0x03, 0x06, 0x00, 0xFF, 0x01, 0x1F, 0x20, 0x81]
-        ack1 = self.send_short_cmd(cmd03, label="CMD03 PID 0x1FFF pass 1")
-        ack2 = self.send_short_cmd(cmd03, label="CMD03 PID 0x1FFF pass 2")
+        return self.cmd_pid_filter([0x1FFF], mode=2)
+
+    def cmd_pid_filter(self, pids: list[int], mode: int = 0) -> bool:
+        """
+        Program CMD 0x03 with the given PIDs, send it twice, then commit with
+        CMD 0x06 (sub_13F76 -> sub_13E90).
+
+        Packet layout (sub_13F76):
+          [03] [4n+2] [2k] [pid_lo] [2k+1] [pid_hi] ... [20] [terminal]
+        Terminal byte: mode 0 -> 0x80 + 2*(n-1); mode 2 -> 0x81 + 2*(n-1).
+
+        Live-verified semantics (LGS8GL5 + MAX2165, EP 0x88):
+          mode 0 = allow-list: only the listed PIDs are forwarded.
+          mode 2 + PID 0x1FFF = clear/reset: all PIDs are forwarded
+            (the Windows post-tune default commit).
+          mode 2 + real PIDs is NOT an allow-list on this hardware: it drops
+            the listed PIDs and pads the output with 0x1FFF null packets.
+        """
+        n = len(pids)
+        if not 1 <= n <= 16:
+            raise ValueError("PID count must be 1..16")
+        if any(not 0 <= pid <= 0x1FFF for pid in pids):
+            raise ValueError("PID values must be 0x0000..0x1FFF")
+
+        cmd03 = [0x03, 4 * n + 2]
+        for k, pid in enumerate(pids):
+            cmd03 += [2 * k, pid & 0xFF, 2 * k + 1, pid >> 8]
+        terminal = (0x81 if mode == 2 else 0x80) + 2 * (n - 1)
+        cmd03 += [0x20, terminal]
+
+        ack1 = self.send_short_cmd(cmd03, label="CMD03 PID filter pass 1")
+        ack2 = self.send_short_cmd(cmd03, label="CMD03 PID filter pass 2")
         ack3 = self.send_short_cmd([0x06, 0x00], label="CMD06 commit")
         return bool(ack1 and ack2 and ack3)
 
