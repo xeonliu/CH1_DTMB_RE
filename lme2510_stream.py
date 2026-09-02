@@ -29,6 +29,7 @@ import argparse
 import datetime as _dt
 import os
 import socket
+import threading
 import time
 
 import lme2510_probe as probe
@@ -316,6 +317,25 @@ def run_stream(args, lme: LoggingLME2510, slog_fh):
     bytes_total = pkts_total = dgrams_total = frames_total = timeouts = 0
     raw_bytes_total = raw_dgrams_total = 0
     last_idle_sample = 0.0
+    status_hits = status_misses = 0
+
+    status_stop = threading.Event()
+
+    def status_reader():
+        """Background EP 0x8A reader while the main loop drains EP 0x88."""
+        nonlocal status_hits, status_misses
+        while not status_stop.is_set():
+            pkt = lme.read_status_packet(timeout_ms=250)
+            if pkt is None:
+                status_misses += 1
+                continue
+            status_hits += 1
+            say(f"STATUS {status_line(decode_status(pkt))}")
+
+    status_thread = None
+    if args.live_status:
+        status_thread = threading.Thread(target=status_reader, daemon=True)
+        status_thread.start()
 
     try:
         while True:
@@ -355,8 +375,14 @@ def run_stream(args, lme: LoggingLME2510, slog_fh):
     except KeyboardInterrupt:
         say("Interrupted by user.")
     finally:
+        if status_thread is not None:
+            status_stop.set()
+            status_thread.join(timeout=1.0)
         elapsed = time.perf_counter() - t0
         sample()
+        if status_thread is not None:
+            say(f"STATUS_THREAD samples={status_hits + status_misses} "
+                f"hits={status_hits} misses={status_misses}")
         if elapsed > 0:
             mbps = bytes_total * 8 / elapsed / 1e6
             say(f"FINAL elapsed={elapsed:.1f}s bytes={bytes_total} "
@@ -396,6 +422,9 @@ def main():
                     help="stop after N seconds (default: until Ctrl-C)")
     ap.add_argument("--telemetry", type=float, default=2.0,
                     help="live register snapshot interval in seconds (0 disables)")
+    ap.add_argument("--live-status", action="store_true",
+                    help="experimental: read EP 0x8A in a background thread "
+                         "while the EP 0x88 forwarding loop continues")
     ap.add_argument("--status-log", default="",
                     help="status/statistics log (default: logs/stream-<time>.log)")
     ap.add_argument("--reg-log", default="",
