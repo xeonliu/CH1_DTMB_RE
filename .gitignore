@@ -20,6 +20,11 @@ build/
 .coverage
 htmlcov/
 
+# Captures / runtime logs
+logs/
+*.ts
+*.ts.raw
+
 # IDE
 .vscode/
 .idea/

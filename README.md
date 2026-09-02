@@ -45,5 +45,20 @@ sudo .venv/bin/python lme2510_stream.py --freq 618 --no-udp \
     --pids 0x0200,0x0201 --file ts2pids.ts --seconds 10
 ```
 
-`lme2510_init.py` and `lme2510_probe.py` expose the same protocol sequence for
-endpoint/register research.  See `LME2510_Analysis.md` section 6.
+`lme2510_stream.py` depends only on `lme2510_probe.py`, `ts_utils.py`, and the
+firmware files under `fw/`.  Protocol details are documented in
+`LME2510_Analysis.md`.
+
+# Firmware files
+
+The firmware blobs under `fw/` are extracted from the Windows driver
+`driver/UDE262D.sys`:
+
+| File                    | Source in `UDE262D.sys` | Size |
+|:------------------------|:------------------------|-----:|
+| `fw/fw_bootloader.bin`  | `unk_20F38`             |  512 |
+| `fw/fw_lgs8g75.bin`     | `unk_21138`             | 4836 |
+| `fw/fw_lgs8gl5.bin`     | `unk_22420`             | 3143 |
+
+The `.sys` file itself contains these binary blocks; they are not shipped by
+the hardware vendor as separate files.

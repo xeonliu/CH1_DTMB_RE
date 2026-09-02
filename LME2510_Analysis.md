@@ -133,7 +133,7 @@ The driver checks if the firmware is loaded (Cold Boot). If not, it performs a 2
 **Post-download activation** (`sub_13EC8`):
 - Driver/script sends `8A 00` after both stages.
 - Device may immediately reset/re-enumerate, so response read may fail transiently.
-- `lme2510_init.py` then waits 2 seconds, re-opens USB, and checks String
+- `lme2510_probe.py` then waits 2 seconds, re-opens USB, and checks String
   Descriptor index 2 for the warm marker.
 
 **Warm marker format:** string descriptor 2 contains raw ASCII bytes:
@@ -203,7 +203,7 @@ The driver controls the Tuner and Demodulator via I2C, bridged through the LME25
 
 **Function**: `sub_13C03` (Tuner Apply Frequency)
 
-### 5.0 Tuner Initialization (`sub_151B1`, implemented in `lme2510_init.py`)
+### 5.0 Tuner Initialization (`sub_151B1`, implemented in `lme2510_probe.py`)
 Before normal tuning, script performs a dedicated init block write:
 - Reads MAX2165 calibration via `sub_14FFE` sequence (`reg 0x0D` writes `1..5`, reads `reg 0x10`).
 - Extracts:
@@ -287,7 +287,7 @@ Full sequence from `sub_13C03` → `sub_1524A`. Frequency input to `sub_13C03` i
 ### 5.3 Lock Status Polling
 
 After tuning, the driver polls Demod register `0x4B` at ~32 ms intervals.  
-`lme2510_init.py` reproduces this by polling `0x4B` and checking bit0, but uses a default interval of **100 ms** (`timeout=5 s`, configurable in function args):
+`lme2510_probe.py` reproduces this by polling `0x4B` and checking bit0, but uses a default interval of **100 ms** (`timeout=5 s`, configurable in function args):
 - Command: `85 02 32 4B xx` → Response: `55 [status]`
 - Known status values observed:
   - `0x01`: Demod locked / locked bit set
@@ -322,10 +322,12 @@ BB [TYPE] [LOCK] [SIGNAL_LEVEL] [SNR_RAW] [HI] [LO] [RESERVED]
 | 6      | `LO`           | Cached as `g_ep8a_ber_or_ctr_lo`. Captured by the parser; no current percent-conversion helper uses it.             |
 | 7      | Reserved       | Observed as `0x00` in captures.                                                                                     |
 
-The current `lme2510_probe.py` is closer to the Windows driver than `lme2510_init.py` because
-`parse_status_packet()` accepts any `0xBB` packet and does not require `TYPE == 0x05`.  However,
-both scripts still use the old field names (`snr = pkt[3]`, `ber_h = pkt[4]`), which do not match
-IDA.  `pkt[3]` is signal level; `pkt[4]` is raw SNR/quality input.
+`lme2510_probe.py` implements the parser the same way the Windows driver does:
+`parse_status_packet()` accepts any `0xBB` packet and does not require
+`TYPE == 0x05`.  The parser still exposes legacy keys (`snr = pkt[3]`,
+`ber_h = pkt[4]`) alongside the correct aliases (`signal_level`, `snr_raw`,
+`hi`, `lo`); only the IDA names match the actual fields — `pkt[3]` is signal
+level and `pkt[4]` is raw SNR/quality input.
 
 The Windows interrupt completion routine (`lme_interrupt_urb_completion`, `0x12252`) also ignores
 the first four `0xBB` status packets before calling `lme_parse_ep8a_status_packet()`.  A strict
