@@ -190,6 +190,32 @@ def status_line(dec: dict) -> str:
             f"strength={dec['strength_pct']}% quality={dec['quality_pct']}%")
 
 
+def status_sample(lme, sink=None, timeout_ms: int = 700,
+                  report_empty: bool = True) -> bool:
+    """Read one EP 0x8A packet and emit a decoded STATUS line.
+
+    Prints to stdout and, when *sink* is given, appends the same line to the
+    status log.  Returns True if a packet arrived.  With report_empty=True a
+    short note is still emitted (and False returned) when the endpoint is
+    silent, so a missing enable step is visible in the log.
+    """
+    pkt = lme.read_status_packet(timeout_ms=timeout_ms)
+    if pkt is None:
+        if report_empty:
+            line = f"STATUS EP 0x8A: no packet within {timeout_ms} ms"
+            print(line)
+            if sink:
+                sink.write(f"{now_ms()} | {line}\n")
+                sink.flush()
+        return False
+    line = f"STATUS {status_line(decode_status(pkt))}"
+    print(line)
+    if sink:
+        sink.write(f"{now_ms()} | {line}\n")
+        sink.flush()
+    return True
+
+
 def telemetry(lme: LoggingLME2510):
     """Read live registers once and log one combined snapshot line."""
     fmt = lambda v: "--" if v is None else f"0x{v:02X}"
@@ -392,6 +418,10 @@ def main():
         lme.tune(args.freq)
         locked = lme.lock_after_tune(chip)
         lme.cmd_pid_filter_default_1fff()
+        # The PID-filter commit (CMD 0x03 x2 + CMD 0x06) is what makes the
+        # bridge start emitting EP 0x8A status packets, so sample right after
+        # it — still before forwarding begins.
+        status_sample(lme, slog_fh, timeout_ms=700)
         print(f"\nLocked: {locked} — forwarding TS on {args.freq} MHz...")
         run_stream(args, lme, slog_fh)
     finally:
