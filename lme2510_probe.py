@@ -866,11 +866,9 @@ class LME2510:
                 packets.append({
                     'type':  pkt[1],
                     'lock':  pkt[2],
-                    'snr':   pkt[3],
-                    'ber_h': pkt[4],
-                    'ctr':   pkt[5],
-                    'ber_l': pkt[6],
-                    # Documented driver field names (see LME2510_Analysis.md):
+                    # Field names follow sub_13708 cache mapping and the
+                    # strength/quality helpers sub_13D13 / sub_13DF2
+                    # (see LME2510_Analysis.md §5.4):
                     'signal_level': pkt[3],
                     'snr_raw':      pkt[4],
                     'hi':           pkt[5],
@@ -888,10 +886,10 @@ class LME2510:
     def read_status_packet(self, timeout_ms: int = 700) -> dict | None:
         """
         Read one 8-byte status packet from EP 0x8A (Interrupt IN).
-        Format: BB 05 [LOCK] [SNR] [BER_H] [CTR] [BER_L] 00
+        Format: BB 05 [LOCK] [SIGNAL_LEVEL] [SNR_RAW] [HI] [LO] 00
 
-        Valid lock:  LOCK=1, SNR stable high, BER_L=0x00
-        False lock:  LOCK=1, SNR jumps erratically, BER_L=0xFF
+        Valid lock:  LOCK=1, SNR stable high, LO=0x00
+        False lock:  LOCK=1, SNR jumps erratically, LO=0xFF
         No signal:   LOCK=0
         """
         try:
@@ -912,7 +910,7 @@ class LME2510:
 
     @staticmethod
     def interpret_status(s: dict) -> str:
-        if s['lock'] and s['ber_l'] == 0x00:
+        if s['lock'] and s['lo'] == 0x00:
             return "GOOD SIGNAL ✓"
         if s['lock']:
             return "false-lock / noise"

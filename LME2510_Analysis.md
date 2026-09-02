@@ -324,10 +324,8 @@ BB [TYPE] [LOCK] [SIGNAL_LEVEL] [SNR_RAW] [HI] [LO] [RESERVED]
 
 `lme2510_probe.py` implements the parser the same way the Windows driver does:
 `parse_status_packet()` accepts any `0xBB` packet and does not require
-`TYPE == 0x05`.  The parser still exposes legacy keys (`snr = pkt[3]`,
-`ber_h = pkt[4]`) alongside the correct aliases (`signal_level`, `snr_raw`,
-`hi`, `lo`); only the IDA names match the actual fields — `pkt[3]` is signal
-level and `pkt[4]` is raw SNR/quality input.
+`TYPE == 0x05`.  The returned keys follow the IDA field names:
+`signal_level = pkt[3]`, `snr_raw = pkt[4]`, `hi = pkt[5]`, `lo = pkt[6]`.
 
 The Windows interrupt completion routine (`lme_interrupt_urb_completion`, `0x12252`) also ignores
 the first four `0xBB` status packets before calling `lme_parse_ep8a_status_packet()`.  A strict

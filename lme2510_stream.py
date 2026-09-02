@@ -169,16 +169,17 @@ def gl5_quality(lock: bool, snr_raw: int) -> int:
 
 def decode_status(pkt: dict) -> dict:
     lock = bool(pkt["lock"])
-    signal = pkt.get("signal_level", pkt["snr"])
-    snr_raw = pkt.get("snr_raw", pkt["ber_h"])
-    hi = pkt.get("hi", pkt["ctr"])
+    signal = pkt["signal_level"]
+    snr_raw = pkt["snr_raw"]
+    hi = pkt["hi"]
+    lo = pkt["lo"]
     return {
         "raw": pkt["raw"],
         "lock": lock,
         "signal": signal,
         "snr_raw": snr_raw,
         "hi": hi,
-        "lo": pkt.get("lo", pkt["ber_l"]),
+        "lo": lo,
         "strength_pct": gl5_strength(lock, signal, hi),
         "quality_pct": gl5_quality(lock, snr_raw),
     }
